@@ -14,12 +14,23 @@ the enums). A connector body should need to import only from ``simple_e``::
 
     from simple_e import stream, destination, Capability, Schema
 
-The engine-facing entry points (``run``, ``load_project``, …) are added in a
-later build stage.
+As of build stage 5 it also exposes the engine entry point :func:`run` — the
+library front door onto the run lifecycle (docs/02 §The triad). The CLI (a
+later stage) is a thin shell over this same function::
+
+    import simple_e
+    result = simple_e.run(connector="shiphero", target="prod")
+
+``run`` returns a :class:`~simple_e.types.RunResult` and never raises on a
+connector/destination failure (docs/07 §4.1).
 """
 
 from __future__ import annotations
 
+# Imported last: simple_e.engine pulls in simple_e.registry / simple_e.types,
+# which are already bound above — no import cycle. The engine is the library's
+# run entry point (docs/02).
+from simple_e.engine import run
 from simple_e.registry import (
     Connector,
     destination,
@@ -38,12 +49,17 @@ from simple_e.types import (
     FieldMode,
     FieldType,
     Record,
+    RunConfig,
+    RunResult,
+    RunStatus,
     Schema,
     SchemaContract,
     State,
     StateBackend,
     StateRecord,
     StreamMeta,
+    StreamResult,
+    StreamStatus,
     WriteDisposition,
 )
 
@@ -52,6 +68,8 @@ __version__ = "0.1.0"
 __all__ = [
     # Version
     "__version__",
+    # Engine entry point (simple_e.engine) — the library front door
+    "run",
     # Decorator API surface (simple_e.registry)
     "stream",
     "resource",
@@ -69,11 +87,16 @@ __all__ = [
     "FieldMode",
     "FieldType",
     "Record",
+    "RunConfig",
+    "RunResult",
+    "RunStatus",
     "Schema",
     "SchemaContract",
     "State",
     "StateBackend",
     "StateRecord",
     "StreamMeta",
+    "StreamResult",
+    "StreamStatus",
     "WriteDisposition",
 ]

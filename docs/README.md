@@ -6,7 +6,7 @@ The #1 design principle is **keep it as simple as possible**. The architectural 
 
 ## How to read this handbook
 
-Read it in order. Sections **00–02** set the *why* — the vision, the competitive landscape, and the high-level architecture. Sections **03–06** define the *contract* — how a connector is written, what its body looks like, and how a project is laid out. Sections **07–10** cover *operating and shipping* the tool — the CLI and library, security, observability, and the roadmap. Each section is self-contained but cross-links the others; later sections assume the contract from 03–06. If you are evaluating simpl.E, read 00–02 and 10 first. If you are writing a connector, 03–05 are the working reference. If you are running it, 07–09.
+Read it in order. Sections **00–02** set the *why* — the vision, the competitive landscape, and the high-level architecture. Sections **03–06** define the *contract* — how a connector is written, what its body looks like, and how a project is laid out. Sections **07–10** cover *operating and shipping* the tool — the CLI and library, security, observability, and the roadmap. Section **11** consolidates every decision deliberately left open for review. Each section is self-contained but cross-links the others; later sections assume the contract from 03–06. If you are evaluating simpl.E, read 00–02, 10, and 11 first. If you are writing a connector, 03–05 are the working reference. If you are running it, 07–09. If you are reviewing this plan to approve or change it, **start with 11**.
 
 ## Table of contents
 
@@ -23,5 +23,4 @@ Read it in order. Sections **00–02** set the *why* — the vision, the competi
 | 08 | [Security](./08-security.md) | Credentials, `profiles.yml`, `${ENV_VAR}` interpolation, secret managers, `.gitignore` defaults, log redaction, and the third-party-connector trust model. |
 | 09 | [Logging and Observability](./09-logging-and-observability.md) | Structured per-run logs, run lifecycle events, the run record and `_simple_e_runs`, log levels and redaction. |
 | 10 | [Roadmap and Scope](./10-roadmap-and-scope.md) | v1 scope, the v1→v2→v3 phased plan, open-source release considerations, and project risks. |
-
-> Sections 00–02 and 03/04/06 are maintained separately; this index references them by filename. Sections 05, 07, 08, 09, and 10 are part of this contribution.
+| 11 | [Open Questions](./11-open-questions.md) | Every decision the handbook deliberately left open, with current leans and what is at stake. Resolve before the v1 freeze. |

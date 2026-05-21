@@ -486,6 +486,10 @@ def close(conn):                         # flush + release — always runs
 | `@destination.state_backend` | If **not** `Capability.STATE` | Returns a companion state backend for Tier B (object-storage) destinations. |
 | `@destination.close` | **Yes** | Flushes and releases resources. Runs even on failure. |
 
+The `Capability` enum referenced above (`STATE`, `MERGE`, `SCHEMA_EVOLUTION`, …)
+is defined in chapter **05 — Destinations & State** §1; a destination declares
+which members it supports, and that set fixes its capability tier.
+
 The engine never calls these out of order. The per-run lifecycle is:
 
 ```

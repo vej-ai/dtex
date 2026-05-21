@@ -1,0 +1,182 @@
+# 08 — Security
+
+> Part of the simpl.E design handbook. See [README.md](./README.md) for the full table of contents.
+
+simpl.E is open source and self-hosted. There is no vendor backend, no managed secret vault, no sandbox you inherit for free. That makes security a **design responsibility of the tool and the operator**, not a deployment afterthought. This section is concrete: where secrets live, how they are resolved, and the honest risks of running other people's connectors.
+
+---
+
+## 1. Where secrets live
+
+simpl.E enforces one rule above all: **secrets never enter version control.**
+
+| File | Committed to git? | Holds secrets? |
+|---|---|---|
+| `register.yaml` | **Yes** | **Never.** Declares config *keys*, not values. |
+| `simple_e_project.yml` | **Yes** | Never. Project metadata only. |
+| `profiles.yml` | **No** — gitignored | Yes — connection config, may reference env vars. |
+| `.env` (optional) | **No** — gitignored | Yes — local env var values. |
+| `.simple_e/` | **No** — gitignored | State and logs (logs are redacted, see §6). |
+
+`register.yaml` is part of a connector and is meant to be shared, even published to a registry. It must therefore be **value-free** for anything sensitive. It declares that a connector *needs* an `api_key`; it never contains one.
+
+```yaml
+# connectors/stripe/register.yaml — committed, no secrets
+name: stripe
+kind: source
+config:
+  api_key:   { required: true, secret: true }   # 'secret: true' → redacted everywhere
+  page_size: { required: false, default: 100 }
+```
+
+The `secret: true` marker is load-bearing: it tells simpl.E to redact this value in logs, in `--dry-run` output, and in run records (§6).
+
+---
+
+## 2. `profiles.yml` and `${ENV_VAR}` interpolation
+
+`profiles.yml` is the operator's file. It holds connection config per environment ("target") and is **never committed**. Secrets in it should themselves be indirections — environment variables or secret-manager references — so the file can be reviewed without exposing live credentials.
+
+```yaml
+# profiles.yml — gitignored
+stripe:
+  default: dev
+  targets:
+    dev:
+      api_key: ${STRIPE_API_KEY_DEV}            # env var interpolation
+      page_size: 100
+    prod:
+      api_key: ${STRIPE_API_KEY_PROD}
+      page_size: 500
+
+bigquery:                                       # a destination profile
+  default: dev
+  targets:
+    dev:
+      type: duckdb
+      path: .simple_e/dev.duckdb                # zero-config local dev
+    prod:
+      type: bigquery
+      project: my-gcp-project
+      dataset: raw
+      credentials: ${GOOGLE_APPLICATION_CREDENTIALS}
+```
+
+### Interpolation rules
+
+- `${VAR}` is replaced with the value of environment variable `VAR` at load time.
+- `${VAR:-default}` supplies a fallback if `VAR` is unset.
+- A `${VAR}` that resolves to nothing for a **required** secret is a hard configuration error (exit code `2` — see [07 §3](./07-cli-and-library-api.md)). simpl.E fails *before* running, naming the missing variable. It never silently runs with an empty credential.
+- Interpolation is **string-substitution only** — no shell, no command execution. `${...}` cannot run code.
+
+For local development, simpl.E auto-loads a gitignored `.env` file from the project root into the environment before interpolation (dotenv convention). In CI and production, the orchestrator/container supplies the variables directly; no `.env` is shipped.
+
+---
+
+## 3. Secret references and pluggable secret managers
+
+Environment variables are the v1 baseline. They are simple and universal, but they put plaintext secrets in the process environment and in CI settings. Teams with stricter requirements want secrets fetched **at run time** from a manager. simpl.E supports this with a typed reference syntax and a pluggable resolver.
+
+A value in `profiles.yml` may be a **secret reference** instead of a literal or `${ENV_VAR}`:
+
+```yaml
+prod:
+  api_key:     secret://gcp-secret-manager/projects/my-proj/secrets/stripe-key/versions/latest
+  credentials: secret://vault/secret/data/warehouse#service_account
+```
+
+A `secret://` URL has the shape `secret://<resolver>/<path>[#<field>]`. At config-resolution time, simpl.E hands the reference to the matching **resolver**:
+
+```python
+class SecretResolver(Protocol):
+    scheme: str   # e.g. "gcp-secret-manager", "aws-secrets-manager", "vault"
+    def resolve(self, path: str, field: str | None) -> str: ...
+```
+
+| Resolver | Scheme | v1? |
+|---|---|---|
+| Environment variables | `${ENV_VAR}` (built-in syntax) | **v1** |
+| GCP Secret Manager | `secret://gcp-secret-manager/...` | v2 |
+| AWS Secrets Manager | `secret://aws-secrets-manager/...` | v2 |
+| HashiCorp Vault | `secret://vault/...` | v2 |
+
+In v1, only env-var interpolation ships built in. The `SecretResolver` protocol and `secret://` parsing exist so a manager can be added as a small package (or a project-local plugin) **without an engine change** — the same extensibility philosophy as the `StateBackend` in [05](./05-destinations-and-state.md). Resolved secret values are held only in memory for the duration of the run and are subject to the redaction rules in §6.
+
+> [Open question: should resolved secrets be cached on disk (encrypted) to avoid a manager round-trip per run, or always fetched fresh? Fresh-every-run is simpler and safer; caching matters only at high run frequency. Proposal: fresh-every-run in v1/v2; revisit caching if it becomes a cost problem.]
+
+---
+
+## 4. `.gitignore` defaults
+
+`simple-e init` writes a `.gitignore` that pre-empts the most common credential leaks. A fresh project is safe by default:
+
+```gitignore
+# simpl.E — generated by `simple-e init`
+profiles.yml          # connection config & secrets — NEVER commit
+.env                  # local environment variables
+*.env
+.simple_e/            # run state, logs, local DuckDB files
+*.duckdb
+__pycache__/
+*.pyc
+
+# allow a committable template so teammates know the shape
+!profiles.example.yml
+```
+
+`simple-e init` also drops a `profiles.example.yml` with the structure but placeholder values — this *is* committed, so a new teammate sees the expected shape without seeing a real key. simpl.E prints a one-line reminder after `init`: *"profiles.yml is gitignored — never commit real credentials."*
+
+A lightweight `simple-e test` (and CI) scans `profiles.yml`'s tracked status: if `profiles.yml` is somehow tracked by git, it emits a loud warning. simpl.E cannot prevent a determined mistake, but it makes the safe path the default and the unsafe path noisy.
+
+---
+
+## 5. File permissions on `profiles.yml`
+
+A secrets file readable by every user on the host is a leak. On creation (`simple-e init`) and whenever simpl.E writes `profiles.yml` or `.env`, it sets mode `0600` (owner read/write only). On every run, simpl.E **checks** the mode of `profiles.yml`:
+
+- World- or group-readable (`o+r` / `g+r`) → a `[warn]` log line: *"profiles.yml is readable by other users — run `chmod 600 profiles.yml`."*
+- This is a warning, not a hard failure: in some container setups the file is mounted read-only with broader bits and the operator has accepted that. simpl.E informs; the operator decides.
+
+The same `0600` expectation applies to `.env` and to any on-disk state that could contain a resolved secret. simpl.E never writes resolved secret *values* to disk (see §3 open question).
+
+---
+
+## 6. Redaction in logs and run records
+
+[09 — Logging and Observability](./09-logging-and-observability.md) specifies the log format; here is the security contract it must honor.
+
+- Every config key marked `secret: true` in `register.yaml`, and every value that arrived via `${ENV_VAR}` or `secret://`, is **redacted** to `***` in: stdout logs, `.simple_e/logs/` files, `--dry-run` config dumps, run records, and exception messages.
+- Redaction is by **value**, not just by key: simpl.E builds a set of known secret values at run start and scrubs any occurrence of them from log strings before they are written. This catches a secret that leaks into, say, an HTTP error body echoed by a connector.
+- Connector code receives the *real* secret (it must, to authenticate) but the engine's logging layer sits between connector output and the log sink. A connector that deliberately `print()`s a secret bypasses redaction — see the trust model below.
+- URLs are redacted of userinfo and query strings that match secret values.
+
+Redaction is best-effort and value-based; it is a strong safety net, not a guarantee against a hostile connector.
+
+---
+
+## 7. Trust model — running third-party connectors
+
+This is the most important and most under-appreciated security fact about simpl.E, and the handbook will not soft-pedal it:
+
+> **A connector is arbitrary Python. Running a connector runs its code on your machine, with your privileges, with access to your credentials.**
+
+simpl.E imports and executes `@stream` / `@destination` functions in-process. A community connector you `pip install` or copy into `connectors/` can read your `profiles.yml`, exfiltrate credentials, read any file your user can read, and make any network call. This is the same trust model as installing any PyPI package or a dbt package with macros — but it must be stated plainly because EL connectors are *expected* to handle credentials.
+
+**simpl.E does not sandbox connector code in v1.** Claiming otherwise would be dishonest — true sandboxing (subprocess isolation, seccomp, containers, capability dropping) is hard, leaky, and out of scope for the v1 simplicity bar. What simpl.E does instead:
+
+1. **Provenance is explicit.** Pre-baked connectors ship inside the `simple_e` package and are reviewed as part of the project. Project-local connectors in `connectors/` are *your* code. A connector from anywhere else is third-party — treat it like any untrusted dependency.
+2. **Read the code.** A connector is a small folder of plain Python. Unlike an Airbyte connector image, it is *meant* to be read before you run it. The folder-of-Python design is itself a security feature: auditability.
+3. **`--allow-unsafe-connectors` gate (v2).** A planned flag so that running a connector whose source is outside the project or the baked set requires explicit opt-in. Without the flag, simpl.E refuses to execute an unrecognized-provenance connector. This does not *sandbox* — it prevents *accidental* execution of untrusted code.
+4. **Least-privilege credentials.** The strongest practical mitigation, and operator-side: give each connector a credential scoped to exactly what it needs (a read-only API token, a warehouse role that can write only its own dataset). If a connector is malicious, the blast radius is that credential. simpl.E's per-connector config makes this natural — every connector has its own credential block.
+5. **Signed connector registry (v3).** If a public connector registry/marketplace materializes (see [10 — Roadmap](./10-roadmap-and-scope.md)), connectors would be signed and checksum-pinned, so what you audited is what you run. This is a future feature, not a v1 promise.
+
+> [Open question: is opt-in subprocess isolation worth building for v2 — run each connector in a child process with a restricted environment (scrubbed env vars, no `profiles.yml` access, only its own resolved config passed in)? It would not stop a determined attacker but would contain accidents and reduce blast radius. It costs IPC complexity and breaks the in-process simplicity. Proposal: prototype after v1; decide based on whether a real community-connector ecosystem emerges.]
+
+**Bottom line for the operator:** treat a simpl.E connector exactly as you treat any third-party Python dependency. Pin versions, read the code of anything you did not write, scope every credential to least privilege, and prefer the pre-baked connectors when they exist.
+
+### Reference
+
+- `profiles.yml` precedence in config resolution → [07 — CLI and Library API](./07-cli-and-library-api.md)
+- Log redaction implementation → [09 — Logging and Observability](./09-logging-and-observability.md)
+- Connector folder layout (`register.yaml`) → [03 — The Connector Contract](./03-connector-contract.md)
+- Registry / marketplace direction → [10 — Roadmap and Scope](./10-roadmap-and-scope.md)

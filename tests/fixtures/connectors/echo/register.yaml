@@ -1,0 +1,44 @@
+# echo — a tiny fixture SOURCE connector for testing the engine + destinations.
+#
+# Not a real connector: its @stream functions yield fixed, deterministic data
+# so tests are reproducible. It exercises the two write dispositions that need
+# the most machinery: an `append` stream with an explicit schema, and a `merge`
+# stream with a primary_key and an `incremental` cursor.
+name: echo
+kind: source
+version: "1.0.0"
+summary: Deterministic fixture source for engine + destination tests.
+tags: [test, fixture]
+
+streams:
+  # An append stream with a fully declared schema, including a JSON column so
+  # the JSON round-trip is exercised end to end.
+  - name: events
+    table: echo_events
+    write_disposition: append
+    schema:
+      - {name: id,       type: INTEGER, mode: REQUIRED}
+      - {name: name,     type: STRING}
+      - {name: amount,   type: FLOAT}
+      - {name: active,   type: BOOLEAN}
+      - {name: payload,  type: JSON}
+
+  # A merge stream: primary_key + an incremental block. The cursor lets a
+  # re-run resume from committed state instead of re-yielding every row, which
+  # is what makes the smoke test's "re-run resumes" assertion observable.
+  - name: items
+    table: echo_items
+    primary_key: id
+    write_disposition: merge
+    incremental:
+      cursor_field: updated_at
+      cursor_type: int
+      initial_value: "0"
+    schema:
+      - {name: id,         type: INTEGER, mode: REQUIRED}
+      - {name: label,      type: STRING}
+      - {name: updated_at, type: INTEGER}
+
+# Bind to the pre-baked DuckDB destination (docs/03 §2.3).
+destination:
+  connector: duckdb

@@ -512,17 +512,19 @@ generalizes ShipHero's `sync_checkpoints` table.
 |---|---|---|
 | `connector` | STRING | Connector `name`. |
 | `stream` | STRING | Stream `name`. |
-| `cursor_value` | STRING | Last observed max cursor value (serialized). |
+| `cursor_value` | JSON | Last observed max cursor value (serialized). |
 | `cursor_type` | STRING | `timestamp` / `date` / `int` / `string` — how to deserialize `cursor_value`. |
 | `state_blob` | JSON | Free-form per-stream `State` contents. |
-| `records_loaded` | INTEGER | Cumulative rows loaded for this stream. |
-| `last_run_at` | TIMESTAMP | Start of the most recent run. |
+| `last_run_id` | STRING | `run_id` of the run that last advanced this row — joins to `_simple_e_runs`. |
+| `rows_total` | INTEGER | Cumulative rows loaded for this stream. |
 | `updated_at` | TIMESTAMP | When this row was last written. |
 
-Primary key: `(connector, stream)`. The engine reads this row at the start of a
-run and writes it after batches are durably loaded — never mid-batch in a way
-that could lose data. Because state lives with the data, a fresh checkout of a
-project resumes correctly with zero local files.
+Primary key: `(connector, stream)`. Eight columns — the canonical schema; this
+table and chapter **05 §5.1** both follow `simple_e/types.py::StateRecord`, the
+source of truth. The engine reads this row at the start of a run and writes it
+after batches are durably loaded — never mid-batch in a way that could lose
+data. Because state lives with the data, a fresh checkout of a project resumes
+correctly with zero local files.
 
 ## 4. The class-based escape hatch
 

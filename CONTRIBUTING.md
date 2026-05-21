@@ -31,3 +31,13 @@ mypy simple_e
 
 Please make sure `pytest`, `ruff check`, and `mypy` all pass before opening a
 pull request.
+
+## Spec precedence: code is the source of truth
+
+The [design handbook](./docs/) (`docs/00`–`docs/11`) was written before the
+implementation and remains the canonical *intent*. But once a contract is
+implemented in code, **the code is the source of truth** — if the handbook and
+the code diverge, fix the handbook to match the code, not the other way around.
+This avoids re-litigating handbook ambiguities at every stage. Notable already:
+`simple_e/types.py::StateRecord` defines the canonical `_simple_e_state` schema
+(docs/03 §3.5 and docs/05 §5.1 follow it).

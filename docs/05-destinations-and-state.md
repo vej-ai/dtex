@@ -169,32 +169,38 @@ State is what makes incremental loads correct. simpl.E stores it **in the destin
 
 ### 5.1 The `_simple_e_state` table
 
-One row per `(connector, stream)`. The cursor value is stored as JSON so it can hold a timestamp, an integer ID, an opaque pagination token, or a composite.
+One row per `(connector, stream)`. The cursor value is stored as JSON so it can hold a timestamp, an integer ID, an opaque pagination token, or a composite. This is the canonical schema — eight columns; `simple_e/types.py` is the source of truth and this table follows it.
 
 | Column | Type | Description |
 |---|---|---|
 | `connector` | `string` | Connector name, e.g. `stripe`. |
 | `stream` | `string` | Stream name within the connector, e.g. `charges`. |
-| `cursor_field` | `string` | The field the cursor tracks, e.g. `created_at`. `NULL` for full-refresh streams. |
-| `cursor_value` | `json` | Last successfully loaded cursor value. The resume point. |
-| `last_run_id` | `string` | `run_id` of the run that last advanced this cursor. |
-| `updated_at` | `timestamp` | When this row was last committed. |
+| `cursor_value` | `json` | Last successfully loaded cursor value. The resume point. `NULL` for full-refresh streams. |
+| `cursor_type` | `string` | `timestamp` / `date` / `int` / `string` — how to deserialize `cursor_value`. `NULL` when no cursor. |
+| `state_blob` | `json` | The per-stream `State` scratch space (free-form key/value), persisted between runs. |
+| `last_run_id` | `string` | `run_id` of the run that last advanced this row. Joins to `_simple_e_runs` for the full audit chain. |
 | `rows_total` | `int` | Cumulative rows ever loaded for this stream (informational). |
+| `updated_at` | `timestamp` | When this row was last committed. |
+
+`cursor_field` is **not** a column — it is recoverable from the stream's manifest. `last_run_at` is **not** a column — it is recoverable by joining `_simple_e_runs` on `last_run_id`.
 
 Primary key: `(connector, stream)`. The table is created lazily by `ensure_schema` on first run, in the same dataset/schema as the loaded tables, prefixed `_simple_e_` so it sorts away from user tables.
 
 ### 5.2 The `StateRecord`
 
-In the library, state is a typed object passed between the engine and the destination:
+In the library, state is a typed object passed between the engine and the destination — one `StateRecord` per `_simple_e_state` row. It is **mutable**: the engine advances `rows_total` / `updated_at` in place across a run, then `to_row()` / `from_row()` form the persistence boundary.
 
 ```python
-@dataclass(frozen=True)
+@dataclass
 class StateRecord:
     connector: str
     stream: str
-    cursor_field: str | None
-    cursor_value: Any          # JSON-serializable
+    cursor_value: Any | None        # JSON-serializable
+    cursor_type: CursorType | None
+    state_blob: Mapping[str, Any]
+    last_run_id: str | None
     rows_total: int
+    updated_at: datetime | None
 ```
 
 ### 5.3 Lifecycle and transactionality

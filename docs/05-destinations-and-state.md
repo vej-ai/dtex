@@ -26,7 +26,7 @@ A destination connector implements a small set of decorated functions. simpl.E d
 
 ```python
 # bigquery/destination.py
-from simple_e import destination, Capability, Schema, Batch, StateRecord
+from simple_e import destination, Capability, Config, Batch, StreamMeta, StateRecord
 
 @destination.capabilities
 def capabilities() -> set[Capability]:
@@ -39,17 +39,17 @@ def capabilities() -> set[Capability]:
     }
 
 @destination.open
-def open(config: dict) -> "Connection":
+def open(config: Config) -> "Connection":
     """Acquire a connection/handle. Called once per run."""
     ...
 
 @destination.ensure_schema
-def ensure_schema(conn, table: str, schema: Schema) -> None:
+def ensure_schema(conn, stream: StreamMeta) -> None:
     """Create the table if absent; ALTER it for additive schema changes."""
     ...
 
 @destination.write_batch
-def write_batch(conn, table: str, batch: Batch, disposition: str) -> int:
+def write_batch(conn, batch: Batch, stream: StreamMeta) -> int:
     """Persist one batch. Return rows written. Engine calls this repeatedly."""
     ...
 
@@ -68,6 +68,8 @@ def close(conn) -> None:
     """Flush and release. Always called, even on failure."""
     ...
 ```
+
+`ensure_schema` and `write_batch` each receive a single **`StreamMeta`** — a frozen object carrying all per-stream metadata the hook needs (`table`, `write_disposition`, `schema`, `primary_key`, `partition_by`, `schema_contract`). New per-stream concerns are added as `StreamMeta` fields, never as new hook parameters, so the destination contract stays stable as the engine grows. The engine builds one `StreamMeta` per stream from the resolved `StreamDef`.
 
 Only `open`, `write_batch`, `ensure_schema`, and `close` are mandatory. `commit_state` / `read_state` are mandatory **only** if the destination declares `Capability.STATE`; otherwise the engine routes state to a companion state backend (see §6).
 
@@ -308,21 +310,21 @@ def open(config):
     return {"url": config["url"], "headers": config.get("headers", {})}
 
 @destination.ensure_schema
-def ensure_schema(conn, table, schema):
+def ensure_schema(conn, stream):
     # No tables to create — the endpoint is schemaless. No-op.
     pass
 
 @destination.write_batch
-def write_batch(conn, table, batch, disposition):
-    if disposition != "append":
+def write_batch(conn, batch, stream):
+    if stream.write_disposition.value != "append":
         raise ValueError("webhook_sink supports only append")
-    payload = json.dumps({"table": table, "rows": batch.rows}).encode()
+    payload = json.dumps({"table": stream.table, "rows": batch}).encode()
     req = urllib.request.Request(
         conn["url"], data=payload, method="POST",
         headers={"Content-Type": "application/json", **conn["headers"]},
     )
     urllib.request.urlopen(req).read()
-    return len(batch.rows)
+    return len(batch)
 
 @destination.close
 def close(conn):

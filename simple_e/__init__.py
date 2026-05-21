@@ -43,6 +43,7 @@ from simple_e.types import (
     State,
     StateBackend,
     StateRecord,
+    StreamMeta,
     WriteDisposition,
 )
 
@@ -73,5 +74,6 @@ __all__ = [
     "State",
     "StateBackend",
     "StateRecord",
+    "StreamMeta",
     "WriteDisposition",
 ]

@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from simple_e import Config, Cursor, CursorType, State, StateRecord
+from simple_e import Config, Cursor, CursorType, State, StateRecord, StreamMeta
 from simple_e.registry import compute_injection
 from simple_e.types import ConnectorManifest, StreamDef
 from tests.conftest import (
@@ -149,30 +149,23 @@ def _drive_one_run(
                 available["cursor"] = cursor
             kwargs = compute_injection(registration.func, available)
 
-            # [engine] ensure_schema — create/evolve the table before loading
+            # [engine] Build the single per-stream StreamMeta from the resolved
+            # StreamDef + schema. It carries table, write_disposition,
+            # primary_key, etc. — every destination hook takes just this object
             # (docs/05 §1). The declared schema is required by the echo fixture.
             assert stream_def.schema is not None
-            hooks["ensure_schema"](conn, stream_def.table, stream_def.schema)
+            stream_meta = StreamMeta.from_stream_def(stream_def, stream_def.schema)
 
-            # [engine] Drive the generator; write each yielded batch per the
-            # stream's write_disposition. merge passes the primary_key.
+            # [engine] ensure_schema — create/evolve the table before loading
+            # (docs/05 §1).
+            hooks["ensure_schema"](conn, stream_meta)
+
+            # [engine] Drive the generator; write each yielded batch. The write
+            # disposition and primary_key both ride along inside stream_meta,
+            # so every disposition takes the same single hook call.
             rows = 0
             for batch in registration.func(**kwargs):
-                if stream_def.write_disposition.value == "merge":
-                    rows += hooks["write_batch"](
-                        conn,
-                        stream_def.table,
-                        batch,
-                        stream_def.write_disposition.value,
-                        primary_key=stream_def.primary_key,
-                    )
-                else:
-                    rows += hooks["write_batch"](
-                        conn,
-                        stream_def.table,
-                        batch,
-                        stream_def.write_disposition.value,
-                    )
+                rows += hooks["write_batch"](conn, batch, stream_meta)
             rows_loaded[stream_def.name] = rows
 
             # [engine] Build the stream's StateRecord — advance the cursor to
@@ -383,9 +376,11 @@ def test_smoke_state_commit_is_what_enables_resume(
     assert items_def is not None and items_def.incremental is not None
 
     # A run that loads `items` but never commits its state.
+    assert items_def.schema is not None
+    items_meta = StreamMeta.from_stream_def(items_def, items_def.schema)
     conn = hooks["open"](Config(params={"path": duckdb_path}))
     try:
-        hooks["ensure_schema"](conn, items_def.table, items_def.schema)
+        hooks["ensure_schema"](conn, items_meta)
         registration = source.registry.stream("items")
         assert registration is not None
         cursor = Cursor(
@@ -394,9 +389,7 @@ def test_smoke_state_commit_is_what_enables_resume(
             start_value=0,
         )
         for batch in registration.func(cursor=cursor):
-            hooks["write_batch"](
-                conn, items_def.table, batch, "merge", primary_key=items_def.primary_key
-            )
+            hooks["write_batch"](conn, batch, items_meta)
         # NOTE: commit_state intentionally NOT called.
     finally:
         hooks["close"](conn)

@@ -137,10 +137,11 @@ class FieldType(_StrEnum):
     warehouse type (docs/05 §3.1). Stored uppercase to match the handbook's
     schema-entry examples (``type: STRING``).
 
-    # NOTE: docs/05 §3.1's mapping table also lists a ``bytes`` type, but
-    # docs/03 §2.2.1 — the authoritative schema-field spec the task points at —
-    # enumerates exactly STRING/INTEGER/FLOAT/BOOLEAN/TIMESTAMP/DATE/JSON. We
-    # follow the schema spec; ``bytes`` can be added without a contract break.
+    # NOTE: ``BYTES`` is included beyond docs/03 §2.2.1's original 7-member
+    # list — every target warehouse (DuckDB BLOB, BigQuery BYTES, Snowflake
+    # BINARY, Postgres BYTEA) has a binary type, and binary-handling sources
+    # (raw signatures, file bytes) need it. This module is the source of
+    # truth; docs/03 §2.2.1 and docs/05 §3.1 follow it.
     """
 
     STRING = "STRING"
@@ -150,6 +151,7 @@ class FieldType(_StrEnum):
     TIMESTAMP = "TIMESTAMP"
     DATE = "DATE"
     JSON = "JSON"
+    BYTES = "BYTES"
 
 
 class FieldMode(_StrEnum):
@@ -572,6 +574,45 @@ class StreamDef:
             schema_contract=SchemaContract.parse(
                 data.get("schema_contract", SchemaContract.EVOLVE)
             ),
+        )
+
+
+@dataclass(frozen=True)
+class StreamMeta:
+    """The per-stream metadata a destination hook needs to write one stream.
+
+    docs/05 §1 / docs/03 §3.4. The engine builds one ``StreamMeta`` per stream
+    from the resolved :class:`StreamDef` and passes it to ``write_batch`` and
+    ``ensure_schema``. It is the *single* metadata object those hooks receive —
+    new per-stream concerns are added as fields here, never as new hook
+    keyword arguments, so the destination contract stays stable as the engine
+    grows. ``schema`` is the resolved, ready-to-write schema (engine-inferred
+    when the stream declares none), distinct from :class:`StreamDef`'s optional
+    declared schema.
+    """
+
+    table: str
+    write_disposition: WriteDisposition
+    schema: Schema
+    primary_key: tuple[str, ...] = ()
+    partition_by: str | None = None
+    schema_contract: SchemaContract = SchemaContract.EVOLVE
+
+    @classmethod
+    def from_stream_def(cls, stream: StreamDef, schema: Schema) -> StreamMeta:
+        """Build a :class:`StreamMeta` from a :class:`StreamDef` plus a resolved schema.
+
+        ``schema`` is the engine's resolved schema for the stream — the declared
+        one when present, otherwise the inferred one. Every other field is
+        copied straight from the declaration.
+        """
+        return cls(
+            table=stream.table,
+            write_disposition=stream.write_disposition,
+            schema=schema,
+            primary_key=stream.primary_key,
+            partition_by=stream.partition_by,
+            schema_contract=stream.schema_contract,
         )
 
 

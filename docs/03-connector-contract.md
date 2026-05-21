@@ -454,11 +454,11 @@ def open(config):                       # acquire a connection — once per run
     ...
 
 @destination.ensure_schema
-def ensure_schema(conn, table, schema): # create/ALTER the table
+def ensure_schema(conn, stream):         # create/ALTER the table
     ...
 
 @destination.write_batch
-def write_batch(conn, table, batch, disposition) -> int:
+def write_batch(conn, batch, stream) -> int:
     """Persist one batch produced by a source @stream. Return rows written."""
     ...
 
@@ -479,8 +479,8 @@ def close(conn):                         # flush + release — always runs
 |---|---|---|
 | `@destination.capabilities` | **Yes** | Returns the `Capability` set the destination supports (`STATE`, `MERGE`, `SCHEMA_EVOLUTION`, …). Fixes the destination's capability tier at init time. |
 | `@destination.open` | **Yes** | Acquires a connection/handle from `config`. Called once per run. |
-| `@destination.ensure_schema` | **Yes** | Creates the target table if absent; performs additive `ALTER` for schema evolution. |
-| `@destination.write_batch` | **Yes** | Persists one batch (a `list[dict]` yielded by a source `@stream`) per the stream's `write_disposition`. Returns rows written. |
+| `@destination.ensure_schema` | **Yes** | Creates the target table if absent; performs additive `ALTER` for schema evolution. Receives a `StreamMeta`. |
+| `@destination.write_batch` | **Yes** | Persists one batch (a `list[dict]` yielded by a source `@stream`) per the stream's `write_disposition`. Receives a `StreamMeta`. Returns rows written. |
 | `@destination.commit_state` | If `Capability.STATE` | Writes cursor state to `_simple_e_state`. Called **only** after all batches durably land. |
 | `@destination.read_state` | If `Capability.STATE` | Loads prior cursor state at run start. |
 | `@destination.state_backend` | If **not** `Capability.STATE` | Returns a companion state backend for Tier B (object-storage) destinations. |

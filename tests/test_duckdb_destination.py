@@ -27,6 +27,8 @@ from simple_e import (
     FieldType,
     Schema,
     StateRecord,
+    StreamMeta,
+    WriteDisposition,
 )
 from simple_e.destinations.duckdb.ddl import (
     duckdb_type,
@@ -59,6 +61,17 @@ _EVENTS_SCHEMA = Schema(
         Field(name="payload", type=FieldType.JSON),
     )
 )
+
+
+def _events_meta(
+    disposition: WriteDisposition = WriteDisposition.APPEND,
+    *,
+    schema: Schema = _EVENTS_SCHEMA,
+) -> StreamMeta:
+    """Build a StreamMeta for the ``echo_events`` table — the hooks' one metadata arg."""
+    return StreamMeta(
+        table="echo_events", write_disposition=disposition, schema=schema
+    )
 
 
 # --------------------------------------------------------------------------
@@ -139,7 +152,7 @@ def test_ensure_schema_creates_table_with_synced_at(
     """ensure_schema creates the table and appends _simple_e_synced_at."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
+    hooks["ensure_schema"](conn, _events_meta())
     hooks["close"](conn)
 
     cols = {
@@ -159,8 +172,8 @@ def test_ensure_schema_is_idempotent(
     """Calling ensure_schema twice (a resumed run) does not error."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)  # no raise
+    hooks["ensure_schema"](conn, _events_meta())
+    hooks["ensure_schema"](conn, _events_meta())  # no raise
     hooks["close"](conn)
 
 
@@ -173,10 +186,10 @@ def test_ensure_schema_additive_evolution_adds_column(
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
 
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
+    hooks["ensure_schema"](conn, _events_meta())
     # Re-run with an extra declared column — additive evolution must add it.
     evolved = Schema(fields=(*_EVENTS_SCHEMA.fields, Field(name="amount", type=FieldType.FLOAT)))
-    hooks["ensure_schema"](conn, "echo_events", evolved)
+    hooks["ensure_schema"](conn, _events_meta(schema=evolved))
     hooks["close"](conn)
 
     cols = {
@@ -203,11 +216,11 @@ def test_write_batch_append_accumulates(
     """append: each batch inserts; rows accumulate across calls — docs/05 §4."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
+    hooks["ensure_schema"](conn, _events_meta())
 
-    n1 = hooks["write_batch"](conn, "echo_events", [{"id": 1, "name": "a"}], "append")
+    n1 = hooks["write_batch"](conn, [{"id": 1, "name": "a"}], _events_meta())
     n2 = hooks["write_batch"](
-        conn, "echo_events", [{"id": 2, "name": "b"}, {"id": 3, "name": "c"}], "append"
+        conn, [{"id": 2, "name": "b"}, {"id": 3, "name": "c"}], _events_meta()
     )
     hooks["close"](conn)
 
@@ -224,8 +237,8 @@ def test_write_batch_stamps_synced_at(
     """write_batch fills _simple_e_synced_at when a record lacks it — docs/03 §2.2.1."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
-    hooks["write_batch"](conn, "echo_events", [{"id": 1, "name": "a"}], "append")
+    hooks["ensure_schema"](conn, _events_meta())
+    hooks["write_batch"](conn, [{"id": 1, "name": "a"}], _events_meta())
     hooks["close"](conn)
 
     synced = query_duckdb(
@@ -240,8 +253,8 @@ def test_write_batch_empty_append_is_noop(
     """An empty append batch writes nothing and returns 0."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
-    assert hooks["write_batch"](conn, "echo_events", [], "append") == 0
+    hooks["ensure_schema"](conn, _events_meta())
+    assert hooks["write_batch"](conn, [], _events_meta()) == 0
     hooks["close"](conn)
 
 
@@ -258,6 +271,20 @@ _ITEMS_SCHEMA = Schema(
 )
 
 
+def _items_meta(
+    disposition: WriteDisposition = WriteDisposition.APPEND,
+    *,
+    primary_key: tuple[str, ...] = (),
+) -> StreamMeta:
+    """Build a StreamMeta for the ``echo_items`` table — the hooks' one metadata arg."""
+    return StreamMeta(
+        table="echo_items",
+        write_disposition=disposition,
+        schema=_ITEMS_SCHEMA,
+        primary_key=primary_key,
+    )
+
+
 def test_write_batch_merge_upserts(
     duckdb_destination: LoadedConnector,
     duckdb_path: str,
@@ -266,22 +293,19 @@ def test_write_batch_merge_upserts(
     """merge: new keys insert, existing keys overwrite in place — docs/05 §4."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_items", _ITEMS_SCHEMA)
+    hooks["ensure_schema"](conn, _items_meta())
 
+    merge_meta = _items_meta(WriteDisposition.MERGE, primary_key=("id",))
     hooks["write_batch"](
         conn,
-        "echo_items",
         [{"id": 1, "label": "one"}, {"id": 2, "label": "two"}],
-        "merge",
-        primary_key=("id",),
+        merge_meta,
     )
     # Re-merge: id=1 overwritten, id=3 inserted, id=2 untouched.
     hooks["write_batch"](
         conn,
-        "echo_items",
         [{"id": 1, "label": "ONE-v2"}, {"id": 3, "label": "three"}],
-        "merge",
-        primary_key=("id",),
+        merge_meta,
     )
     hooks["close"](conn)
 
@@ -295,9 +319,13 @@ def test_write_batch_merge_requires_primary_key(
     """merge without a primary_key fails fast with a clear message."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_items", _ITEMS_SCHEMA)
+    hooks["ensure_schema"](conn, _items_meta())
+    # A merge StreamMeta with no primary_key — StreamMeta itself does not
+    # validate, so this is constructible; write_batch is what must raise.
     with pytest.raises(ValueError, match="primary_key"):
-        hooks["write_batch"](conn, "echo_items", [{"id": 1, "label": "x"}], "merge")
+        hooks["write_batch"](
+            conn, [{"id": 1, "label": "x"}], _items_meta(WriteDisposition.MERGE)
+        )
     hooks["close"](conn)
 
 
@@ -316,18 +344,19 @@ def test_write_batch_replace_truncates_once_per_run(
 
     # Run 1 — seed two rows via append.
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_items", _ITEMS_SCHEMA)
+    hooks["ensure_schema"](conn, _items_meta())
     hooks["write_batch"](
-        conn, "echo_items", [{"id": 9, "label": "old-a"}, {"id": 8, "label": "old-b"}], "append"
+        conn, [{"id": 9, "label": "old-a"}, {"id": 8, "label": "old-b"}], _items_meta()
     )
     hooks["close"](conn)
 
     # Run 2 — replace with two batches: the first truncates, the second must
     # NOT re-truncate (or batch 1's rows would vanish).
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_items", _ITEMS_SCHEMA)
-    hooks["write_batch"](conn, "echo_items", [{"id": 1, "label": "new-1"}], "replace")
-    hooks["write_batch"](conn, "echo_items", [{"id": 2, "label": "new-2"}], "replace")
+    hooks["ensure_schema"](conn, _items_meta())
+    replace_meta = _items_meta(WriteDisposition.REPLACE)
+    hooks["write_batch"](conn, [{"id": 1, "label": "new-1"}], replace_meta)
+    hooks["write_batch"](conn, [{"id": 2, "label": "new-2"}], replace_meta)
     hooks["close"](conn)
 
     rows = dict(query_duckdb(duckdb_path, "SELECT id, label FROM echo_items"))
@@ -342,9 +371,9 @@ def test_write_batch_replace_empty_batch_still_truncates(
     """replace with an empty batch is a valid empty snapshot — it truncates."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_items", _ITEMS_SCHEMA)
-    hooks["write_batch"](conn, "echo_items", [{"id": 1, "label": "x"}], "append")
-    hooks["write_batch"](conn, "echo_items", [], "replace")
+    hooks["ensure_schema"](conn, _items_meta())
+    hooks["write_batch"](conn, [{"id": 1, "label": "x"}], _items_meta())
+    hooks["write_batch"](conn, [], _items_meta(WriteDisposition.REPLACE))
     hooks["close"](conn)
 
     count = query_duckdb(duckdb_path, "SELECT count(*) FROM echo_items")[0][0]
@@ -364,15 +393,14 @@ def test_json_column_round_trip(
     """dict / list values land in a JSON column and read back faithfully."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path)
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
+    hooks["ensure_schema"](conn, _events_meta())
     hooks["write_batch"](
         conn,
-        "echo_events",
         [
             {"id": 1, "name": "a", "payload": {"tags": ["x", "y"], "n": 3}},
             {"id": 2, "name": "b", "payload": ["plain", "list"]},
         ],
-        "append",
+        _events_meta(),
     )
     hooks["close"](conn)
 
@@ -546,8 +574,8 @@ def test_dataset_param_places_tables_in_schema(
     """The `dataset` param puts loaded tables inside a DuckDB schema."""
     hooks = _hooks(duckdb_destination)
     conn = _open(duckdb_destination, duckdb_path, dataset="analytics")
-    hooks["ensure_schema"](conn, "echo_events", _EVENTS_SCHEMA)
-    hooks["write_batch"](conn, "echo_events", [{"id": 1, "name": "a"}], "append")
+    hooks["ensure_schema"](conn, _events_meta())
+    hooks["write_batch"](conn, [{"id": 1, "name": "a"}], _events_meta())
     hooks["close"](conn)
 
     schema = query_duckdb(

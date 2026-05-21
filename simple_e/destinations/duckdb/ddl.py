@@ -9,11 +9,7 @@ Keeps ``destination.py`` focused on the lifecycle hooks. This module owns:
 * the small DDL fragments ``ensure_schema`` emits (``CREATE TABLE`` /
   ``ALTER TABLE ADD COLUMN``).
 
-# NOTE: docs/05 §3.1's mapping table lists a ``bytes`` row (DuckDB ``BLOB``),
-# but ``simple_e/types.py::FieldType`` — the source of truth per CONTRIBUTING.md
-# — defines exactly seven members and no ``BYTES``. We map the seven that
-# exist; ``BLOB`` can be added without a contract break if ``FieldType`` gains
-# a ``BYTES`` member.
+The mapping is total over :class:`~simple_e.types.FieldType`'s eight members.
 """
 
 from __future__ import annotations
@@ -34,10 +30,11 @@ _FIELD_TYPE_TO_DUCKDB: dict[FieldType, str] = {
     FieldType.TIMESTAMP: "TIMESTAMP",
     FieldType.DATE: "DATE",
     FieldType.JSON: "JSON",
+    FieldType.BYTES: "BLOB",
 }
 """simpl.E :class:`FieldType` → DuckDB column type — docs/05 §3.1.
 
-The full set of seven logical types; every member of ``FieldType`` has an
+The full set of eight logical types; every member of ``FieldType`` has an
 entry, so :func:`duckdb_type` is total.
 """
 

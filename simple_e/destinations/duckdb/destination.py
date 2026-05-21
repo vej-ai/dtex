@@ -44,6 +44,7 @@ from simple_e import (
     Config,
     Schema,
     StateRecord,
+    StreamMeta,
     WriteDisposition,
     destination,
 )
@@ -188,13 +189,13 @@ def close(conn: DuckConn) -> None:
 
 
 @destination.ensure_schema
-def ensure_schema(conn: DuckConn, table: str, schema: Schema) -> None:
+def ensure_schema(conn: DuckConn, stream: StreamMeta) -> None:
     """Create the target table if absent; additively evolve it — docs/05 §3.
 
     docs/05 §3.1: translate the stream's :class:`Schema` into native DDL.
-    docs/05 §3.2: additive evolution — a field present in ``schema`` but absent
-    from an existing table is added with ``ALTER TABLE ADD COLUMN`` (nullable;
-    existing rows get ``NULL``).
+    docs/05 §3.2: additive evolution — a field present in ``stream.schema`` but
+    absent from an existing table is added with ``ALTER TABLE ADD COLUMN``
+    (nullable; existing rows get ``NULL``).
 
     The engine appends ``_simple_e_synced_at`` to every record (docs/03
     §2.2.1); this hook calls :meth:`Schema.with_synced_at` so the physical
@@ -207,7 +208,8 @@ def ensure_schema(conn: DuckConn, table: str, schema: Schema) -> None:
     run *before* this hook is called), so ``ensure_schema`` itself is always
     additive — it never needs to know the contract.
     """
-    full_schema = schema.with_synced_at()
+    table = stream.table
+    full_schema = stream.schema.with_synced_at()
     validate_identifier(table, kind="table")
 
     existing = _table_columns(conn, table)
@@ -251,14 +253,7 @@ def _table_columns(conn: DuckConn, table: str) -> set[str] | None:
 
 
 @destination.write_batch
-def write_batch(
-    conn: DuckConn,
-    table: str,
-    batch: Batch,
-    disposition: str,
-    *,
-    primary_key: tuple[str, ...] = (),
-) -> int:
+def write_batch(conn: DuckConn, batch: Batch, stream: StreamMeta) -> int:
     """Persist one batch per its write disposition — docs/05 §4. Returns rows written.
 
     docs/05 §4 dispositions, as implemented for DuckDB:
@@ -276,17 +271,14 @@ def write_batch(
     that column with the current UTC time for any record that does not already
     carry it, so a load timestamp is always present (docs/03 §2.2.1).
 
-    # NOTE: docs/05 §1's ``write_batch`` signature is positional
-    # ``(conn, table, batch, disposition)``. ``merge`` genuinely needs the
-    # ``primary_key`` to build the ``ON CONFLICT`` target, and docs/04 says
-    # per-stream metadata "arrives as the hook's own arguments". It is added
-    # here as a *keyword-only* parameter with a default, so the documented
-    # positional call still works unchanged and a non-merge engine call need
-    # not pass it. The engine (stage 5) passes ``primary_key=...`` for merge
-    # streams; the smoke test does the same at the manual-wiring seam.
+    All per-stream metadata — ``table``, ``write_disposition``,
+    ``primary_key`` — arrives in the single :class:`StreamMeta` argument
+    (docs/05 §1). New per-stream concerns become ``StreamMeta`` fields, never
+    new hook parameters, so this signature stays stable as the engine grows.
     """
+    table = stream.table
     validate_identifier(table, kind="table")
-    wd = WriteDisposition.parse(disposition)
+    wd = stream.write_disposition
 
     if not batch:
         # An empty batch is a valid no-op — but a ``replace`` stream that
@@ -305,14 +297,14 @@ def write_batch(
     elif wd is WriteDisposition.APPEND:
         _insert_rows(conn, table, columns, stamped)
     elif wd is WriteDisposition.MERGE:
-        if not primary_key:
+        if not stream.primary_key:
             raise ValueError(
                 f"write_batch: disposition 'merge' for table {table!r} requires a "
                 f"primary_key (docs/05 §4)"
             )
-        _merge_rows(conn, table, columns, primary_key, stamped)
+        _merge_rows(conn, table, columns, stream.primary_key, stamped)
     else:  # pragma: no cover — WriteDisposition is a closed 3-member enum.
-        raise ValueError(f"write_batch: unknown disposition {disposition!r}")
+        raise ValueError(f"write_batch: unknown disposition {wd!r}")
 
     return len(stamped)
 

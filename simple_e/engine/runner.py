@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -246,12 +247,46 @@ def _resolve_destination_hooks(
             f"destination {dest.manifest.name!r} does not declare Capability.STATE; "
             f"Tier B (companion state backend) destinations are not supported in v1"
         )
+
+    if Capability.TRANSACTIONAL_LOAD in capabilities:
+        # The destination promises atomic per-stream loads — it must provide the
+        # @destination.transaction context the engine wraps each stream's
+        # write_batch + commit_state block in (docs/05 §5.3).
+        hook = registry.hook("transaction")
+        if hook is None:
+            raise EngineError(
+                f"destination {dest.manifest.name!r} declares "
+                f"Capability.TRANSACTIONAL_LOAD but is missing the "
+                f"@destination.transaction hook required to honor it (docs/05 §5.3)"
+            )
+        hooks["transaction"] = hook.func
     return hooks, capabilities
 
 
 # ---------------------------------------------------------------------------
 # Stream execution — one stream's EXTRACT → NORMALIZE → LOAD → COMMIT
 # ---------------------------------------------------------------------------
+
+
+def _stream_transaction(
+    hooks: Mapping[str, Callable[..., Any]],
+    conn: Any,
+    stream_meta: StreamMeta,
+) -> Any:
+    """Return the context wrapping a stream's load + state commit — docs/05 §5.3.
+
+    When the destination declares :attr:`Capability.TRANSACTIONAL_LOAD` it
+    provides a ``@destination.transaction`` hook; the engine enters it around
+    each stream's ``[write_batch… → commit_state]`` block so data and cursor
+    flip atomically and a crash mid-stream rolls back (no half-written
+    ``append`` duplicates). A destination without the capability gets a
+    :func:`~contextlib.nullcontext` — the load runs in the destination's own
+    statement-level semantics, unchanged.
+    """
+    tx = hooks.get("transaction")
+    if tx is None:
+        return nullcontext()
+    return tx(conn, stream_meta)
 
 
 def _run_one_stream(
@@ -262,7 +297,7 @@ def _run_one_stream(
     run_config: RunConfig,
     prior: StateRecord | None,
     log: Any,
-) -> tuple[StreamResult, StateRecord]:
+) -> StreamResult:
     """Run one stream end to end — docs/02 §Run lifecycle step 5 (a–d).
 
     The per-stream pipeline (docs/02 §extract → normalize → load):
@@ -274,14 +309,16 @@ def _run_one_stream(
     * **5b — resolve schema** — the declared schema, else one inferred from the
       first batch (``evolve`` mode); a ``strict`` stream's first batch is
       checked against its declared schema and a divergence fails the run.
-    * **5c — ensure + load** — ``ensure_schema`` once, then drive the ``@stream``
-      generator and ``write_batch`` each yielded batch, accumulating rows.
-    * **5d — commit** — build the advanced :class:`StateRecord` and (in the
-      caller) ``commit_state`` it immediately.
+    * **5c — ensure + load** — ``ensure_schema`` once (outside the transaction —
+      DDL implicitly commits on some destinations), then, inside the
+      per-stream transaction (docs/05 §5.3), drive the ``@stream`` generator,
+      ``write_batch`` each yielded batch, and ``commit_state`` the advanced
+      cursor. The transaction makes the data + cursor flip atomic.
 
-    Returns the stream's :class:`StreamResult` and its new :class:`StateRecord`.
-    Raises whatever the connector raises — the caller marks the stream FAILED
-    and stops the run, keeping earlier streams' committed state.
+    Returns the stream's :class:`StreamResult`. Raises whatever the connector
+    raises — the per-stream transaction rolls the partial load back, then the
+    caller marks the stream FAILED and stops the run, keeping earlier streams'
+    committed state.
     """
     registration = source.registry.stream(stream_def.name)
     if registration is None:  # pragma: no cover — validate_connector caught it.
@@ -316,56 +353,67 @@ def _run_one_stream(
         available["cursor"] = cursor
     kwargs = compute_injection(registration.func, available)
 
-    # -- 5b/5c: drive the generator, resolving schema on the first batch -----
+    # -- 5b: NORMALIZE — pull the first batch and resolve the schema --------
+    # The generator is iterated manually so ensure_schema can run *before* the
+    # per-stream transaction opens: DDL implicitly commits on some destinations
+    # (e.g. DuckDB), so a CREATE/ALTER inside the transaction would break its
+    # atomicity. ensure_schema therefore stays outside; write_batch +
+    # commit_state run inside (docs/05 §5.3).
     rows_loaded = 0
     rows_extracted = 0
-    stream_meta: StreamMeta | None = None
-    first = True
-    for batch in registration.func(**kwargs):
-        rows_extracted += len(batch)
-        if first:
-            # NORMALIZE: resolve the schema once, from the declaration or — in
-            # evolve mode — inferred from this first batch (docs/02 §Normalize).
-            if stream_def.schema is not None:
-                if stream_def.schema_contract is SchemaContract.STRICT:
-                    _check_strict_schema(stream_def, stream_def.schema, batch)
-                resolved_schema = stream_def.schema
-            else:
-                resolved_schema = _infer_schema(batch)
-            stream_meta = StreamMeta.from_stream_def(stream_def, resolved_schema)
-            hooks["ensure_schema"](conn, stream_meta)
-            first = False
-        assert stream_meta is not None
-        rows_loaded += hooks["write_batch"](conn, batch, stream_meta)
+    batches = iter(registration.func(**kwargs))
+    first_batch = next(batches, None)
 
-    if first:
-        # The generator yielded nothing — there was no first batch to infer
-        # from or to ensure a table against. The stream still needs a schema:
-        # use the declared one, or an empty inferred schema. ensure_schema then
-        # creates an empty table so the stream exists in the warehouse.
+    if first_batch is not None and stream_def.schema is not None:
+        if stream_def.schema_contract is SchemaContract.STRICT:
+            _check_strict_schema(stream_def, stream_def.schema, first_batch)
+        resolved_schema = stream_def.schema
+    elif first_batch is not None:
+        # evolve mode — infer the schema from the first batch (docs/02 §Normalize).
+        resolved_schema = _infer_schema(first_batch)
+    else:
+        # The generator yielded nothing — use the declared schema, or an empty
+        # one, so ensure_schema still creates an (empty) table for the stream.
         resolved_schema = stream_def.schema if stream_def.schema is not None else Schema()
-        stream_meta = StreamMeta.from_stream_def(stream_def, resolved_schema)
-        hooks["ensure_schema"](conn, stream_meta)
 
-    # -- 5d: build the advanced StateRecord (committed by the caller) -------
-    cursor_after = cursor_before
-    if cursor is not None and cursor.observed_max is not None:
-        cursor_after = cursor.observed_max
+    stream_meta = StreamMeta.from_stream_def(stream_def, resolved_schema)
+    hooks["ensure_schema"](conn, stream_meta)
 
-    record = StateRecord(
-        connector=run_config.connector,
-        stream=stream_def.name,
-        cursor_value=cursor_after,
-        cursor_type=(
-            stream_def.incremental.cursor_type
-            if stream_def.incremental is not None
-            else None
-        ),
-        state_blob=state.to_dict(),
-        last_run_id=run_config.run_id,
-        rows_total=(prior.rows_total if prior is not None else 0) + rows_loaded,
-    )
-    result = StreamResult(
+    # -- 5c/5d: LOAD + COMMIT — inside the per-stream transaction -----------
+    # write_batch each batch (starting with the one already pulled), then
+    # commit the advanced cursor. On a connector exception the transaction
+    # rolls back the partial load (docs/05 §5.3) and the error propagates.
+    with _stream_transaction(hooks, conn, stream_meta):
+        if first_batch is not None:
+            rows_extracted += len(first_batch)
+            rows_loaded += hooks["write_batch"](conn, first_batch, stream_meta)
+            for batch in batches:
+                rows_extracted += len(batch)
+                rows_loaded += hooks["write_batch"](conn, batch, stream_meta)
+
+        cursor_after = cursor_before
+        if cursor is not None and cursor.observed_max is not None:
+            cursor_after = cursor.observed_max
+
+        record = StateRecord(
+            connector=run_config.connector,
+            stream=stream_def.name,
+            cursor_value=cursor_after,
+            cursor_type=(
+                stream_def.incremental.cursor_type
+                if stream_def.incremental is not None
+                else None
+            ),
+            state_blob=state.to_dict(),
+            last_run_id=run_config.run_id,
+            rows_total=(prior.rows_total if prior is not None else 0) + rows_loaded,
+        )
+        # 5d — per-stream commit, inside the transaction: the data written
+        # above and this cursor advance flip atomically (docs/02 §Commit
+        # granularity, docs/05 §5.3).
+        hooks["commit_state"](conn, run_config.run_id, [record])
+
+    return StreamResult(
         name=stream_def.name,
         rows_extracted=rows_extracted,
         rows_loaded=rows_loaded,
@@ -373,7 +421,6 @@ def _run_one_stream(
         cursor_after=cursor_after,
         status=StreamStatus.SUCCEEDED,
     )
-    return result, record
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +576,7 @@ def run(
                 continue
             log.info("running stream %r", stream_def.name)
             try:
-                result, record = _run_one_stream(
+                result = _run_one_stream(
                     stream_def,
                     source,
                     hooks,
@@ -539,15 +586,15 @@ def run(
                     log,
                 )
             except Exception as exc:  # noqa: BLE001 — recorded, then re-raised.
+                # _run_one_stream commits this stream's state inside its own
+                # per-stream transaction (rolled back on this failure). Earlier
+                # streams already committed keep their progress (docs/02
+                # §Commit granularity).
                 streams.append(
                     StreamResult(name=stream_def.name, status=StreamStatus.FAILED)
                 )
                 stream_error = exc
                 break
-            # 5d — per-stream commit: persist THIS stream's cursor immediately,
-            # after its batches durably landed. A later stream failing cannot
-            # lose this one's progress (docs/02 §Commit granularity).
-            hooks["commit_state"](conn, run_id, [record])
             streams.append(result)
             log.info(
                 "stream %r loaded %d row(s)", stream_def.name, result.rows_loaded

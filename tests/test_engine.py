@@ -651,6 +651,84 @@ def test_run_failing_stream_keeps_prior_stream_state(
     assert streams_committed.get("good") == 2
     assert "bad" not in streams_committed  # bad failed before its commit_state
 
+    # The TRANSACTIONAL_LOAD guarantee (docs/05 §5.3): the `bad` stream yielded
+    # one batch — {"id": 3} — which write_batch persisted, then raised. Because
+    # DuckDB declares TRANSACTIONAL_LOAD, that write happened inside the
+    # per-stream transaction; the failure rolled it back. The table exists
+    # (ensure_schema runs outside the transaction) but holds ZERO rows — no
+    # half-written append duplicates for the re-run to trip over.
+    bad_rows = _query(duckdb_path, "SELECT COUNT(*) FROM partial_bad")
+    assert bad_rows[0][0] == 0
+
+
+def test_run_append_stream_rollback_leaves_no_partial_rows(
+    tmp_path: Path, duckdb_path: str
+) -> None:
+    """A crash mid-append rolls back every batch already written this run.
+
+    docs/05 §5.3: this is the guarantee TRANSACTIONAL_LOAD exists for. An
+    ``append`` stream that yields several batches and then fails must leave the
+    table empty — otherwise every crash would duplicate rows on the next run.
+    The connector here yields three batches (6 rows) before raising; all six
+    must be rolled back.
+    """
+    _write_project(tmp_path)
+    folder = tmp_path / "connectors" / "crasher"
+    folder.mkdir(parents=True)
+    (folder / "register.yaml").write_text(
+        textwrap.dedent(
+            """\
+            name: crasher
+            kind: source
+            version: "1.0.0"
+            summary: an append stream that crashes after several batches.
+            streams:
+              - name: rows
+                table: crasher_rows
+                write_disposition: append
+                schema:
+                  - {name: id, type: INTEGER}
+            destination:
+              connector: duckdb
+            """
+        )
+    )
+    (folder / "source.py").write_text(
+        textwrap.dedent(
+            """\
+            from simple_e import Batch, stream
+            from collections.abc import Iterator
+
+
+            @stream(name="rows")
+            def rows() -> Iterator[Batch]:
+                yield [{"id": 1}, {"id": 2}]
+                yield [{"id": 3}, {"id": 4}]
+                yield [{"id": 5}, {"id": 6}]
+                raise RuntimeError("boom — after 6 rows written this run")
+            """
+        )
+    )
+
+    result = simple_e.run(
+        connector="crasher",
+        target="dev",
+        project_dir=str(tmp_path),
+        destination_params={"path": duckdb_path},
+    )
+    assert result.status.value == "failed"
+    assert isinstance(result.error, RuntimeError)
+
+    # Every one of the 6 written rows was rolled back — the table is empty.
+    landed = _query(duckdb_path, "SELECT COUNT(*) FROM crasher_rows")
+    assert landed[0][0] == 0
+    # ...and no cursor/state row was committed for the stream either.
+    state = _query(
+        duckdb_path,
+        "SELECT COUNT(*) FROM _simple_e_state WHERE connector = 'crasher'",
+    )
+    assert state[0][0] == 0
+
 
 def test_run_inferred_schema_for_undeclared_stream(
     tmp_path: Path, duckdb_path: str

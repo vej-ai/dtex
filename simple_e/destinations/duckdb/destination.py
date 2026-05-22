@@ -32,6 +32,8 @@ raw ``duckdb`` connection — see its docstring for why.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -113,16 +115,12 @@ def capabilities() -> set[Capability]:
     * ``SCHEMA_EVOLUTION`` — DuckDB supports ``ALTER TABLE ADD COLUMN`` for
       additive evolution (docs/05 §3.2).
 
-    # NOTE: ``TRANSACTIONAL_LOAD`` IS declared. DuckDB has full ACID on a
-    # single connection, so a batch load and the state commit *can* be made
-    # atomic — which is exactly what the capability asserts (docs/05 §1, §5.3).
-    # One subtlety: DDL (``CREATE``/``ALTER TABLE``) implicitly commits in
-    # DuckDB, so the engine (stage 5) must open its ``BEGIN`` *after*
-    # ``ensure_schema`` and close ``COMMIT`` after ``commit_state`` for the
-    # data+state flip to be one transaction. This hook only *declares* the
-    # capability; stage 4 opens no transactions because no engine drives them
-    # yet — the lifecycle is otherwise correct without an explicit BEGIN
-    # (DuckDB auto-commits each statement).
+    * ``TRANSACTIONAL_LOAD`` — DuckDB has full ACID on a single connection, so
+      a stream's batch loads and its state commit are made atomic by the
+      ``@destination.transaction`` hook below. The engine wraps each stream's
+      ``[write_batch… → commit_state]`` block in that context; a crash
+      mid-stream rolls back, so an ``append`` stream never leaves half-written
+      duplicates (docs/05 §5.3).
     """
     return {
         Capability.STATE,
@@ -130,6 +128,41 @@ def capabilities() -> set[Capability]:
         Capability.SCHEMA_EVOLUTION,
         Capability.TRANSACTIONAL_LOAD,
     }
+
+
+# --------------------------------------------------------------------------
+# transaction — docs/05 §1, §5.3 (conditional on Capability.TRANSACTIONAL_LOAD)
+# --------------------------------------------------------------------------
+
+
+@destination.transaction
+@contextmanager
+def transaction(conn: DuckConn, stream: StreamMeta) -> Iterator[None]:
+    """Wrap one stream's load + state commit in a DuckDB transaction — docs/05 §5.3.
+
+    The engine enters this context per stream, *after* ``ensure_schema`` (DDL
+    implicitly commits in DuckDB, so the table must already exist), around the
+    ``write_batch`` loop and the ``commit_state`` call. On a clean exit the data
+    and the advanced cursor flip atomically with ``COMMIT``; if any
+    ``write_batch`` raises, ``ROLLBACK`` discards the partial load so a re-run
+    starts the stream cleanly — the guarantee that matters for ``append``
+    streams, which would otherwise duplicate rows on every crash.
+
+    Per-stream scope matches simpl.E's per-stream commit model (docs/02
+    §Commit granularity): each stream is independently atomic; an earlier
+    stream that already committed keeps its progress.
+    """
+    conn.conn.execute("BEGIN TRANSACTION")
+    try:
+        yield
+    except Exception:
+        conn.conn.execute("ROLLBACK")
+        # A rolled-back ``replace`` truncation never happened — clear the
+        # per-run guard so a retry within the same run truncates again.
+        conn.replace_truncated.discard(stream.table)
+        raise
+    else:
+        conn.conn.execute("COMMIT")
 
 
 # --------------------------------------------------------------------------

@@ -336,13 +336,19 @@ DESTINATION_HOOKS: frozenset[str] = frozenset(
         "commit_state",
         "read_state",
         "state_backend",
+        "transaction",
         "close",
     }
 )
 """Every valid ``@destination.*`` hook name — docs/03 §3.4, docs/05 §1.
 
-Eight hooks. ``@destination.<anything-else>`` (e.g. a ``write_batchs`` typo)
+Nine hooks. ``@destination.<anything-else>`` (e.g. a ``write_batchs`` typo)
 raises :class:`AttributeError` at import time.
+
+``transaction`` is a *conditionally* mandatory hook: a destination that
+declares ``Capability.TRANSACTIONAL_LOAD`` must define it (a context-manager
+hook the engine wraps around each stream's ``[ensure_schema → write_batch… →
+commit_state]`` block, so data and cursor flip atomically per stream).
 """
 
 # NOTE: docs/03 §3.4 / docs/05 §1 mark capabilities/open/ensure_schema/

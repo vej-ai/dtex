@@ -484,6 +484,7 @@ def close(conn):                         # flush + release — always runs
 | `@destination.commit_state` | If `Capability.STATE` | Writes cursor state to `_simple_e_state`. Called **only** after all batches durably land. |
 | `@destination.read_state` | If `Capability.STATE` | Loads prior cursor state at run start. |
 | `@destination.state_backend` | If **not** `Capability.STATE` | Returns a companion state backend for Tier B (object-storage) destinations. |
+| `@destination.transaction` | If `Capability.TRANSACTIONAL_LOAD` | A context-manager hook the engine wraps around each stream's `write_batch`+`commit_state` block, so data and cursor flip atomically. See chapter 05 §1. |
 | `@destination.close` | **Yes** | Flushes and releases resources. Runs even on failure. |
 
 The `Capability` enum referenced above (`STATE`, `MERGE`, `SCHEMA_EVOLUTION`, …)

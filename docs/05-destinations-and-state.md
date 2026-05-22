@@ -71,12 +71,27 @@ def close(conn) -> None:
 
 `ensure_schema` and `write_batch` each receive a single **`StreamMeta`** — a frozen object carrying all per-stream metadata the hook needs (`table`, `write_disposition`, `schema`, `primary_key`, `partition_by`, `schema_contract`). New per-stream concerns are added as `StreamMeta` fields, never as new hook parameters, so the destination contract stays stable as the engine grows. The engine builds one `StreamMeta` per stream from the resolved `StreamDef`.
 
-Only `open`, `write_batch`, `ensure_schema`, and `close` are mandatory. `commit_state` / `read_state` are mandatory **only** if the destination declares `Capability.STATE`; otherwise the engine routes state to a companion state backend (see §6).
+Only `open`, `write_batch`, `ensure_schema`, and `close` are mandatory. `commit_state` / `read_state` are mandatory **only** if the destination declares `Capability.STATE`; otherwise the engine routes state to a companion state backend (see §6). `transaction` is mandatory **only** if the destination declares `Capability.TRANSACTIONAL_LOAD`.
+
+`@destination.transaction` is a **context-manager hook** — a destination that declares `Capability.TRANSACTIONAL_LOAD` provides it, and the engine enters it once per stream, wrapping that stream's `[write_batch… → commit_state]` block (but **not** `ensure_schema`, whose DDL may implicitly commit). On a clean exit the data and the advanced cursor flip atomically; on any exception the partial load rolls back. This is what makes an `append` stream crash-safe — without it, every mid-stream crash would leave half-written rows that the re-run duplicates. Per-stream scope matches simpl.E's per-stream commit model (§5.3).
+
+```python
+@destination.transaction
+@contextmanager
+def transaction(conn, stream: StreamMeta):
+    conn.begin()
+    try:
+        yield
+    except Exception:
+        conn.rollback(); raise
+    else:
+        conn.commit()
+```
 
 The engine never calls these functions out of order. The lifecycle per run is:
 
 ```
-open → read_state → [ensure_schema → write_batch ...]* → commit_state → close
+open → read_state → [ ensure_schema → ⟨transaction: write_batch ... → commit_state⟩ ]* → close
 ```
 
 `close` is guaranteed to run even if any step raises.

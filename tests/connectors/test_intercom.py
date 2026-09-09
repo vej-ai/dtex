@@ -601,3 +601,44 @@ def test_search_empty_window_observes_immediately_when_nothing_is_buffered(
         _fake_stream_def("tickets"), _fake_config(window_days=1), cursor, logging.getLogger("t"),  # type: ignore[arg-type]
     ))
     assert cursor.events == [("observe", day - 1), ("observe", 2 * day - 1)]
+
+
+def test_contacts_truncated_tag_list_is_completed(
+    stub: tuple[_Stub, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A contact whose embedded tags say has_more gets the full list via
+    GET /contacts/{id}/tags; an untruncated contact costs no extra call."""
+    scenario, base_url = stub
+    monkeypatch.setenv("INTERCOM_ACCESS_TOKEN", "tok_unit")
+    monkeypatch.setattr(intercom_source.time, "time", lambda: 1_700_000_000)
+
+    def responder(req: _Request) -> tuple[int, Any, dict[str, str]]:
+        if req.route == "/contacts/search":
+            return 200, {"data": [
+                {"id": "c1", "updated_at": 1_699_999_000,
+                 "tags": {"type": "list", "url": "/contacts/c1/tags", "has_more": True,
+                          "total_count": 12,
+                          "data": [{"id": str(i), "type": "tag"} for i in range(10)]}},
+                {"id": "c2", "updated_at": 1_699_999_100,
+                 "tags": {"type": "list", "url": "/contacts/c2/tags", "has_more": False,
+                          "total_count": 1, "data": [{"id": "77", "type": "tag"}]}},
+            ], "pages": {}}, {}
+        if req.route == "/contacts/c1/tags":
+            return 200, {"type": "list", "data": [{"id": str(i), "type": "tag", "name": f"t{i}"}
+                                                  for i in range(12)]}, {}
+        return 404, {"errors": [{"code": "not_found", "message": req.route}]}, {}
+
+    scenario.responder = responder
+    _write_project(tmp_path)
+    _write_config(tmp_path, base_url=base_url, params="  window_days: 0\n", streams="  contacts:")
+    result, db_path = _run(tmp_path)
+    assert result.status.value == "succeeded", result.error
+    assert [r.route for r in scenario.captured] == ["/contacts/search", "/contacts/c1/tags"]
+    conn = duckdb.connect(db_path)
+    rows = conn.execute("SELECT id, tags FROM contacts ORDER BY id").fetchall()
+    conn.close()
+    t1, t2 = json.loads(str(rows[0][1])), json.loads(str(rows[1][1]))
+    assert len(t1["data"]) == 12 and t1["has_more"] is False and t1["total_count"] == 12
+    assert t1["data"][11] == {"id": "11", "type": "tag", "name": "t11"}
+    assert t2 == {"type": "list", "url": "/contacts/c2/tags", "has_more": False,
+                  "total_count": 1, "data": [{"id": "77", "type": "tag"}]}

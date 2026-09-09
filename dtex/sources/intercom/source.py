@@ -134,6 +134,38 @@ def _window_query(a: int | None, b: int) -> dict[str, Any]:
     return {"operator": "AND", "value": clauses}
 
 
+
+# Contact objects embed at most 10 entries of their `tags` / `companies` /
+# `notes` lists and flag the truncation (`has_more: true`, `total_count`,
+# `url`). Airbyte's connector shipped that truncated list; the full list is
+# one GET away, and only the flagged contacts (a few hundred per workspace)
+# pay for it.
+_CONTACT_LISTS = ("tags", "companies", "notes")
+
+
+def _complete_contact_lists(client: IntercomClient, record: dict[str, Any]) -> dict[str, Any]:
+    """Replace every truncated embedded list on a contact with the full one."""
+    out = record
+    for key in _CONTACT_LISTS:
+        envelope = record.get(key)
+        if not isinstance(envelope, dict) or not envelope.get("has_more"):
+            continue
+        url = envelope.get("url") or f"/contacts/{record.get('id')}/{key}"
+        items: list[dict[str, Any]] = []
+        for page in client.list_cursor(str(url), "data"):
+            items.extend(page)
+        if out is record:
+            out = dict(record)
+        out[key] = {
+            "type": envelope.get("type", "list"),
+            "url": url,
+            "data": items,
+            "total_count": len(items),
+            "has_more": False,
+        }
+    return out
+
+
 _SEARCH_PATHS: dict[str, tuple[str, str]] = {
     "contacts": ("/contacts/search", "data"),
     "conversations": ("/conversations/search", "conversations"),
@@ -181,6 +213,10 @@ def _extract_search(
                 records += len(page)
                 if stream_def.name == "tickets":
                     batch.extend(_project(_flatten_ticket(r), columns) for r in page)
+                elif stream_def.name == "contacts":
+                    batch.extend(
+                        _project(_complete_contact_lists(client, r), columns) for r in page
+                    )
                 else:
                     batch.extend(_project(r, columns) for r in page)
                 if len(batch) >= batch_size:

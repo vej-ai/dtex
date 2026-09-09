@@ -46,7 +46,7 @@
 
 name: intercom
 kind: source
-version: "1.0.1"
+version: "1.0.2"
 summary: Intercom REST API — contacts, conversations (+ transcript parts), tickets, companies, articles and workspace dimensions.
 tags: [intercom, saas, support, messaging, crm, rest]
 
@@ -172,9 +172,9 @@ streams:
       - {name: location,              type: JSON}
       - {name: social_profiles,       type: JSON}
       - {name: custom_attributes,     type: JSON}
-      - {name: tags,                  type: JSON, description: "{type: list, data: [{id, type, url}]} — ids only; join the tags stream for names."}
-      - {name: notes,                 type: JSON}
-      - {name: companies,             type: JSON}
+      - {name: tags,                  type: JSON, description: "{type: list, data: [{id, type, url}], total_count, has_more: false} — the FULL list (a truncated embed is completed via /contacts/{id}/tags); ids only, join the tags stream for names."}
+      - {name: notes,                 type: JSON, description: "Full list (completed when the embed was truncated)."}
+      - {name: companies,             type: JSON, description: "Full list (completed when the embed was truncated)."}
       - {name: opted_in_subscription_types,  type: JSON}
       - {name: opted_out_subscription_types, type: JSON}
 

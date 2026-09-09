@@ -113,3 +113,6 @@ appears in logs or error text.
   6-hour lookback covers indexing lag on freshly changed records.
 - Contact `tags` carry ids only (`{data: [{id}]}`); join the `tags` stream
   for names. Conversation and company tags carry names inline.
+- Intercom embeds at most 10 `tags` / `companies` / `notes` on a contact
+  and flags the rest with `has_more`; the connector fetches the full list
+  for those contacts, so the landed arrays are complete (Airbyte's were not).

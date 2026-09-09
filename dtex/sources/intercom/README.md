@@ -25,10 +25,12 @@ models.
 The span from the cursor to now is tiled into `window_days`-wide
 `updated_at` windows (default 7). Each window is one search
 (`updated_at > a-1 AND updated_at < b+1`, paginated with `starting_after`,
-150 per page) and every page is yielded as one batch. `cursor.observe`
-fires once per **completed** window with the window end, so `ordered: true`
-is exact: a mid-run state flush persists the end of the last complete
-window and a crashed run resumes by re-pulling the interrupted window.
+150 per page); pages are buffered into `batch_size`-row batches (default
+5000 — one destination load each, which matters on BigQuery where load jobs
+per table per day are capped). `cursor.observe` fires for a **completed**
+window only after every row of that window has been yielded, so `ordered:
+true` is exact: a mid-run state flush persists the end of the last complete,
+landed window and a crashed run resumes by re-pulling the interrupted one.
 Steady state (cursor ≈ now, `lookback: 6h`) is one window per run.
 
 With no cursor (`--full-refresh`) the walk is a single unbounded search.

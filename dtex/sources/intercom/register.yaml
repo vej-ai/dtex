@@ -11,11 +11,12 @@
 #   /<resource>/search with an `updated_at` window. Incremental on
 #   `updated_at` (cursor_type int). The span from the cursor to now is tiled
 #   into `window_days`-wide windows, each paginated independently
-#   (`starting_after` cursor, 150 per page). The cursor is observed only when
-#   a window completes, so `ordered: true` is exact: a mid-run state flush
-#   persists the end of the last *complete* window and a crashed run resumes
-#   by re-pulling the interrupted window. Steady state (cursor ≈ now) is one
-#   window per run.
+#   (`starting_after` cursor, 150 per page); pages are buffered into
+#   `batch_size`-row batches (one destination load each). The cursor is
+#   observed only for windows whose rows have been yielded, so `ordered:
+#   true` is exact: a mid-run state flush persists the end of the last
+#   complete, landed window and a crashed run resumes by re-pulling the
+#   interrupted one. Steady state (cursor ≈ now) is one window per run.
 #
 # * `conversation_parts` — the transcript. Per-conversation fan-out: for
 #   every conversation whose `updated_at` falls in the window (sorted
@@ -45,7 +46,7 @@
 
 name: intercom
 kind: source
-version: "1.0.0"
+version: "1.0.1"
 summary: Intercom REST API — contacts, conversations (+ transcript parts), tickets, companies, articles and workspace dimensions.
 tags: [intercom, saas, support, messaging, crm, rest]
 
@@ -79,8 +80,8 @@ params:
     description: conversation_parts only — stop after this many conversations (0 = unlimited); the cursor resumes from the last one landed.
   batch_size:
     type: int
-    default: 500
-    description: Records per yielded batch for the fan-out and dimension streams (search streams yield one page per batch).
+    default: 5000
+    description: Rows per yielded batch (= one destination load). Search pages are buffered up to this; the fan-out and catalog streams default to 2000 when unset.
   requests_per_second:
     type: float
     default: 12.0

@@ -147,10 +147,20 @@ def _extract_search(
     cursor: Cursor,
     log: logging.Logger | logging.LoggerAdapter[Any],
 ) -> Iterator[Batch]:
-    """Shared extract for the three search streams — see the module docstring."""
+    """Shared extract for the three search streams — see the module docstring.
+
+    Pages are buffered into ``batch_size``-row batches (one destination load
+    per batch — BigQuery caps load jobs per table per day, so a 150-row
+    page per load would exhaust it on a backfill). The cursor is observed
+    for a completed window only once every row of that window has been
+    *yielded*: a window whose rows are still in the buffer is not a safe
+    resume point, because the engine may persist the observed maximum
+    after any yielded batch lands.
+    """
     path, items_key = _SEARCH_PATHS[stream_def.name]
     columns = _declared_columns(stream_def)
     window_days = int(config.get("window_days") if config.get("window_days") is not None else 7)
+    batch_size = max(1, int(config.get("batch_size") or 5000))
     now = int(time.time())
     start = _as_int(cursor.start_value())
     windows = _iter_windows(start, now, window_days)
@@ -160,6 +170,9 @@ def _extract_search(
         " (full_refresh)" if cursor.is_full_refresh else "",
     )
     records = 0
+    batch: list[dict[str, Any]] = []
+    landed_window_end: int | None = None    # end of the last window fully yielded
+    buffered_window_end: int | None = None  # end of the last window fully buffered
     with _build_client(config, log) as client:
         for index, (a, b) in enumerate(windows, start=1):
             pages = 0
@@ -167,17 +180,32 @@ def _extract_search(
                 pages += 1
                 records += len(page)
                 if stream_def.name == "tickets":
-                    yield [_project(_flatten_ticket(r), columns) for r in page]
+                    batch.extend(_project(_flatten_ticket(r), columns) for r in page)
                 else:
-                    yield [_project(r, columns) for r in page]
-            # The window is complete: everything Intercom had for it has
-            # been yielded, so its end is a safe resume point.
-            cursor.observe(b)
+                    batch.extend(_project(r, columns) for r in page)
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+                    # Everything buffered before this yield is now with the
+                    # engine; earlier complete windows are safe resume points.
+                    if buffered_window_end is not None:
+                        landed_window_end = buffered_window_end
+                        cursor.observe(landed_window_end)
+            # The window is complete: every row Intercom had for it is in
+            # the buffer (or already yielded).
+            buffered_window_end = b
+            if not batch:
+                landed_window_end = b
+                cursor.observe(b)
             if pages or index % 25 == 0:
                 log.info(
                     "intercom.%s: window %d/%d [%s, %d] pages=%d records_total=%d",
                     stream_def.name, index, len(windows), a, b, pages, records,
                 )
+    if batch:
+        yield batch
+    if buffered_window_end is not None and buffered_window_end != landed_window_end:
+        cursor.observe(buffered_window_end)
     log.info("intercom.%s: extract complete records=%d", stream_def.name, records)
 
 
@@ -260,7 +288,7 @@ def conversation_parts(
     columns = _declared_columns(stream_def)
     window_days = int(config.get("window_days") if config.get("window_days") is not None else 7)
     cap = int(config.get("max_conversations_per_run") or 0)
-    batch_size = max(1, int(config.get("batch_size") or 500))
+    batch_size = max(1, int(config.get("batch_size") or 2000))
     now = int(time.time())
     start = _as_int(cursor.start_value())
     windows = _iter_windows(start, now, window_days)
@@ -356,7 +384,7 @@ def _single(
 def companies(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iterator[Batch]:
     """Every company — GET /companies/scroll (no updated_at filter exists)."""
     columns = _declared_columns(stream_def)
-    batch_size = max(1, int(config.get("batch_size") or 500))
+    batch_size = max(1, int(config.get("batch_size") or 2000))
     with _build_client(config, log) as client:
         yield from _batched(client.scroll("/companies/scroll", "data"), columns, batch_size)
 
@@ -398,6 +426,6 @@ def data_attributes(stream_def: StreamDef, config: Config, log: logging.Logger) 
 def articles(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iterator[Batch]:
     """Every help-center article — GET /articles (page-number pagination)."""
     columns = _declared_columns(stream_def)
-    batch_size = max(1, int(config.get("batch_size") or 500))
+    batch_size = max(1, int(config.get("batch_size") or 2000))
     with _build_client(config, log) as client:
         yield from _batched(client.list_pages("/articles", "data"), columns, batch_size)

@@ -10,6 +10,20 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-09-09
+
+### Fixed
+
+- **`intercom` search streams load in `batch_size`-row batches, not one
+  per API page.** Each 150-row page was yielded as its own batch, i.e. one
+  destination load job per page; a first backfill of a few hundred thousand
+  contacts would have taken hours and blown through BigQuery's load-jobs-
+  per-table-per-day quota. Pages are now buffered up to `batch_size`
+  (default 5000; `conversation_parts`, `companies` and `articles` default
+  to 2000), and the cursor is observed for a completed window only once
+  that window's rows have been yielded, so `ordered: true` stays exact
+  under mid-run state flushes.
+
 ## [0.12.0] — 2026-09-09
 
 ### Added
@@ -996,7 +1010,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/vej-ai/dtex/releases/tag/v0.12.1
 [0.12.0]: https://github.com/vej-ai/dtex/releases/tag/v0.12.0
 [0.11.0]: https://github.com/vej-ai/dtex/releases/tag/v0.11.0
 [0.10.2]: https://github.com/vej-ai/dtex/releases/tag/v0.10.2

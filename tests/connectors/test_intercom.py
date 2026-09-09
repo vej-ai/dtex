@@ -21,6 +21,7 @@ Areas:
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -496,3 +497,107 @@ def test_client_does_not_sleep_when_unpaced() -> None:
     client._bucket.acquire()
     assert sleeps == []
     assert time.monotonic() > 0
+
+
+# --------------------------------------------------------------------------
+# Batching and deferred cursor observation (0.12.1)
+# --------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    def __init__(self, start: int | None) -> None:
+        self._start = start
+        self.is_full_refresh = False
+        self.events: list[tuple[str, Any]] = []
+
+    def start_value(self) -> int | None:
+        return self._start
+
+    def observe(self, value: Any) -> None:
+        self.events.append(("observe", value))
+
+
+class _FakeClient:
+    """Two windows × two pages of 3 rows each; `updated_at` = window start."""
+
+    def __init__(self) -> None:
+        self.queries: list[dict[str, Any]] = []
+
+    def __enter__(self) -> _FakeClient:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def search(
+        self, path: str, query: dict[str, Any], items_key: str
+    ) -> Iterator[list[dict[str, Any]]]:
+        self.queries.append(query)
+        lo = query["value"][0]["value"] + 1
+        for page in range(2):
+            yield [{"id": f"{lo}-{page}-{i}", "updated_at": lo + i} for i in range(3)]
+
+
+def _fake_stream_def(name: str) -> Any:
+    """Only `.name` and `.schema[].name` are read by the extract helper."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        name=name,
+        schema=[SimpleNamespace(name="id"), SimpleNamespace(name="updated_at")],
+    )
+
+
+def _fake_config(**params: Any) -> Any:
+    class _C:
+        secrets = {"access_token": "t"}
+
+        def get(self, key: str, default: Any = None) -> Any:
+            return params.get(key, default)
+    return _C()
+
+
+def test_search_batches_span_windows_and_observe_only_landed_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """batch_size=8 over 2 windows × 6 rows (pages of 3): the first yield
+    (9 rows, after the page that crossed the threshold) lands window 1 plus
+    part of window 2 → observe(window-1 end) right after that yield, never
+    window 2 until its remaining rows are yielded at the end."""
+    client = _FakeClient()
+    monkeypatch.setattr(intercom_source, "_build_client", lambda config, log: client)
+    day = 86400
+    monkeypatch.setattr(intercom_source.time, "time", lambda: 2 * day - 1)
+    cursor = _FakeCursor(0)
+    events: list[tuple[str, Any]] = cursor.events
+    gen = intercom_source._extract_search(
+        _fake_stream_def("contacts"), _fake_config(window_days=1, batch_size=8),
+        cursor, logging.getLogger("t"),  # type: ignore[arg-type]
+    )
+    for batch in gen:
+        events.append(("yield", len(batch)))
+    assert events == [
+        ("yield", 9), ("observe", day - 1),      # window 1 landed with the first batch
+        ("yield", 3), ("observe", 2 * day - 1),  # window 2 landed by the final flush
+    ]
+    assert [q["value"][0]["value"] + 1 for q in client.queries] == [0, day]
+
+
+def test_search_empty_window_observes_immediately_when_nothing_is_buffered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Empty(_FakeClient):
+        def search(
+            self, path: str, query: dict[str, Any], items_key: str
+        ) -> Iterator[list[dict[str, Any]]]:
+            self.queries.append(query)
+            return iter(())
+
+    client = _Empty()
+    monkeypatch.setattr(intercom_source, "_build_client", lambda config, log: client)
+    day = 86400
+    monkeypatch.setattr(intercom_source.time, "time", lambda: 2 * day - 1)
+    cursor = _FakeCursor(0)
+    list(intercom_source._extract_search(
+        _fake_stream_def("tickets"), _fake_config(window_days=1), cursor, logging.getLogger("t"),  # type: ignore[arg-type]
+    ))
+    assert cursor.events == [("observe", day - 1), ("observe", 2 * day - 1)]

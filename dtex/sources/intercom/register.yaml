@@ -1,0 +1,423 @@
+# Intercom — baked source connector for the REST API (v2.16).
+#
+# Every workspace object Intercom exposes for reporting, landed in the same
+# column shapes Airbyte's source-intercom produces (top-level scalars as
+# columns, nested objects as JSON, unix-second timestamps as INTEGER) so a
+# dbt project can switch its `source()` schema without rewriting models.
+#
+# Three extraction surfaces:
+#
+# * Search streams — `contacts`, `conversations`, `tickets` — POST
+#   /<resource>/search with an `updated_at` window. Incremental on
+#   `updated_at` (cursor_type int). The span from the cursor to now is tiled
+#   into `window_days`-wide windows, each paginated independently
+#   (`starting_after` cursor, 150 per page). The cursor is observed only when
+#   a window completes, so `ordered: true` is exact: a mid-run state flush
+#   persists the end of the last *complete* window and a crashed run resumes
+#   by re-pulling the interrupted window. Steady state (cursor ≈ now) is one
+#   window per run.
+#
+# * `conversation_parts` — the transcript. Per-conversation fan-out: for
+#   every conversation whose `updated_at` falls in the window (sorted
+#   ascending client-side), GET /conversations/{id} and yield one row per
+#   part, plus one row for the opening message (`part_type:
+#   conversation_source`, id = the source id). Cursor = the conversation's
+#   `updated_at`, observed after each conversation lands, so
+#   `max_conversations_per_run` caps a backfill into resumable chunks (like
+#   `bootstrap_max_pages` on the cockroachdb connector). Off by default in a
+#   config's `streams:` unless selected — it is one HTTP call per touched
+#   conversation.
+#
+# * Dimension streams — `admins`, `teams`, `tags`, `segments`,
+#   `ticket_types`, `data_attributes`: one request each, `replace`.
+#   `companies` walks GET /companies/scroll (Intercom has no updated_at
+#   filter on companies) and merges on id. `articles` pages GET /articles.
+#
+# Auth: an access token from an Intercom app installed on the workspace
+# (Developer Hub → your app → Authentication). Read scopes for every stream
+# here. `region` picks the host: us → api.intercom.io, eu →
+# api.eu.intercom.io, au → api.au.intercom.io — a token only answers on its
+# workspace's own host.
+#
+# Rate limiting: Intercom answers 429 with X-RateLimit-Reset (unix seconds);
+# the client waits for it (bounded) and a token bucket keeps steady-state
+# traffic under `requests_per_second`.
+
+name: intercom
+kind: source
+version: "1.0.0"
+summary: Intercom REST API — contacts, conversations (+ transcript parts), tickets, companies, articles and workspace dimensions.
+tags: [intercom, saas, support, messaging, crm, rest]
+
+requires:
+  - "requests>=2.31"
+
+params:
+  region:
+    type: string
+    default: "us"
+    description: Workspace data-hosting region — us, eu or au. Picks the API host.
+  base_url:
+    type: string
+    default: ""
+    description: Override the API host (stubbed tests). Empty = derived from `region`.
+  api_version:
+    type: string
+    default: "2.16"
+    description: Value of the Intercom-Version header.
+  page_size:
+    type: int
+    default: 150
+    description: Records per page (Intercom's max is 150).
+  window_days:
+    type: int
+    default: 7
+    description: Width of each updated_at window the search streams tile the cursor→now span into.
+  max_conversations_per_run:
+    type: int
+    default: 0
+    description: conversation_parts only — stop after this many conversations (0 = unlimited); the cursor resumes from the last one landed.
+  batch_size:
+    type: int
+    default: 500
+    description: Records per yielded batch for the fan-out and dimension streams (search streams yield one page per batch).
+  requests_per_second:
+    type: float
+    default: 12.0
+    description: Client-side token-bucket ceiling. Intercom's per-app limit is far higher; this keeps a backfill polite.
+  max_retries:
+    type: int
+    default: 5
+    description: Retries for 429 / 5xx / connection errors before giving up.
+  retry_backoff_seconds:
+    type: float
+    default: 1.0
+    description: Base seconds for exponential backoff on 5xx (1, 2, 4, ...).
+  rate_limit_max_wait_seconds:
+    type: float
+    default: 60.0
+    description: Longest single wait honoured from X-RateLimit-Reset / Retry-After on a 429.
+  timeout_seconds:
+    type: float
+    default: 60.0
+    description: Per-request HTTP timeout.
+
+secrets:
+  - name: access_token
+    ref: ${env.INTERCOM_ACCESS_TOKEN}
+
+streams:
+  # ---------------------------------------------------------------------
+  # Search streams — windowed on updated_at
+  # ---------------------------------------------------------------------
+  - name: contacts
+    table: contacts
+    primary_key: id
+    write_disposition: merge
+    partition_by: none   # explicit — merge tables of modest size; no auto-partition on an int cursor
+    incremental:
+      cursor_field: updated_at
+      cursor_type: int
+      lookback: 6h
+      initial_value: "1577836800"   # 2020-01-01T00:00:00Z
+      ordered: true   # cursor observed per completed window only
+    schema:
+      - {name: id,                    type: STRING,  mode: REQUIRED}
+      - {name: type,                  type: STRING}
+      - {name: workspace_id,          type: STRING}
+      - {name: external_id,           type: STRING}
+      - {name: role,                  type: STRING}
+      - {name: email,                 type: STRING}
+      - {name: phone,                 type: STRING}
+      - {name: name,                  type: STRING}
+      - {name: avatar,                type: STRING}
+      - {name: owner_id,              type: INTEGER}
+      - {name: created_at,            type: INTEGER}
+      - {name: updated_at,            type: INTEGER, mode: REQUIRED}
+      - {name: signed_up_at,          type: INTEGER}
+      - {name: last_seen_at,          type: INTEGER}
+      - {name: last_replied_at,       type: INTEGER}
+      - {name: last_contacted_at,     type: INTEGER}
+      - {name: last_email_opened_at,  type: INTEGER}
+      - {name: last_email_clicked_at, type: INTEGER}
+      - {name: language_override,     type: STRING}
+      - {name: browser,               type: STRING}
+      - {name: browser_version,       type: STRING}
+      - {name: browser_language,      type: STRING}
+      - {name: os,                    type: STRING}
+      - {name: android_app_name,      type: STRING}
+      - {name: android_app_version,   type: STRING}
+      - {name: android_device,        type: STRING}
+      - {name: android_os_version,    type: STRING}
+      - {name: android_sdk_version,   type: STRING}
+      - {name: android_last_seen_at,  type: INTEGER}
+      - {name: ios_app_name,          type: STRING}
+      - {name: ios_app_version,       type: STRING}
+      - {name: ios_device,            type: STRING}
+      - {name: ios_os_version,        type: STRING}
+      - {name: ios_sdk_version,       type: STRING}
+      - {name: ios_last_seen_at,      type: INTEGER}
+      - {name: unsubscribed_from_emails, type: BOOLEAN}
+      - {name: unsubscribed_from_sms, type: BOOLEAN}
+      - {name: has_hard_bounced,      type: BOOLEAN}
+      - {name: marked_email_as_spam,  type: BOOLEAN}
+      - {name: sms_consent,           type: BOOLEAN}
+      - {name: referrer,              type: STRING}
+      - {name: utm_campaign,          type: STRING}
+      - {name: utm_content,           type: STRING}
+      - {name: utm_medium,            type: STRING}
+      - {name: utm_source,            type: STRING}
+      - {name: utm_term,              type: STRING}
+      - {name: location,              type: JSON}
+      - {name: social_profiles,       type: JSON}
+      - {name: custom_attributes,     type: JSON}
+      - {name: tags,                  type: JSON, description: "{type: list, data: [{id, type, url}]} — ids only; join the tags stream for names."}
+      - {name: notes,                 type: JSON}
+      - {name: companies,             type: JSON}
+      - {name: opted_in_subscription_types,  type: JSON}
+      - {name: opted_out_subscription_types, type: JSON}
+
+  - name: conversations
+    table: conversations
+    primary_key: id
+    write_disposition: merge
+    partition_by: none   # explicit — merge tables of modest size; no auto-partition on an int cursor
+    incremental:
+      cursor_field: updated_at
+      cursor_type: int
+      lookback: 6h
+      initial_value: "1577836800"
+      ordered: true
+    schema:
+      - {name: id,                    type: STRING,  mode: REQUIRED}
+      - {name: type,                  type: STRING}
+      - {name: title,                 type: STRING}
+      - {name: created_at,            type: INTEGER}
+      - {name: updated_at,            type: INTEGER, mode: REQUIRED}
+      - {name: waiting_since,         type: INTEGER}
+      - {name: snoozed_until,         type: INTEGER}
+      - {name: open,                  type: BOOLEAN}
+      - {name: state,                 type: STRING}
+      - {name: read,                  type: BOOLEAN}
+      - {name: priority,              type: STRING}
+      - {name: admin_assignee_id,     type: INTEGER}
+      - {name: team_assignee_id,      type: INTEGER}
+      - {name: ai_agent_participated, type: BOOLEAN}
+      - {name: ai_agent,              type: JSON}
+      - {name: tags,                  type: JSON, description: "{type: tag.list, tags: [{id, name, applied_at, applied_by}]} — names inline."}
+      - {name: conversation_rating,   type: JSON}
+      - {name: source,                type: JSON, description: "The opening message: type, delivered_as, subject, body, author, url, attachments."}
+      - {name: contacts,              type: JSON, description: "{type: contact.list, contacts: [{type, id, external_id}]}"}
+      - {name: teammates,             type: JSON}
+      - {name: custom_attributes,     type: JSON}
+      - {name: first_contact_reply,   type: JSON}
+      - {name: sla_applied,           type: JSON}
+      - {name: statistics,            type: JSON, description: "time_to_admin_reply, first_admin_reply_at, time_to_first_close, last_close_at, count_reopens, ..."}
+      - {name: linked_objects,        type: JSON}
+      - {name: topics,                type: JSON}
+
+  - name: tickets
+    table: tickets
+    primary_key: id
+    write_disposition: merge
+    partition_by: none   # explicit — merge tables of modest size; no auto-partition on an int cursor
+    incremental:
+      cursor_field: updated_at
+      cursor_type: int
+      lookback: 6h
+      initial_value: "1577836800"
+      ordered: true
+    schema:
+      - {name: id,                          type: STRING,  mode: REQUIRED}
+      - {name: type,                        type: STRING}
+      - {name: ticket_id,                   type: STRING, description: "The human-facing ticket number shown in the inbox."}
+      - {name: category,                    type: STRING}
+      - {name: created_at,                  type: INTEGER}
+      - {name: updated_at,                  type: INTEGER, mode: REQUIRED}
+      - {name: snoozed_until,               type: INTEGER}
+      - {name: open,                        type: BOOLEAN}
+      - {name: is_shared,                   type: BOOLEAN}
+      - {name: ticket_state,                type: STRING, description: "State category: submitted, in_progress, waiting_on_customer, resolved (flattened from the 2.12+ ticket_state object)."}
+      - {name: ticket_state_id,             type: STRING}
+      - {name: ticket_state_internal_label, type: STRING}
+      - {name: ticket_state_external_label, type: STRING}
+      - {name: admin_assignee_id,           type: STRING}
+      - {name: team_assignee_id,            type: STRING}
+      - {name: ticket_type,                 type: JSON}
+      - {name: ticket_attributes,           type: JSON, description: "Keyed by attribute name: _default_title_, _default_description_ and custom attributes."}
+      - {name: contacts,                    type: JSON}
+      - {name: linked_objects,              type: JSON}
+      - {name: ticket_parts,                type: JSON, description: "{type: ticket_part.list, ticket_parts: [...]} — the thread and state transitions."}
+
+  # ---------------------------------------------------------------------
+  # Transcript fan-out
+  # ---------------------------------------------------------------------
+  - name: conversation_parts
+    table: conversation_parts
+    primary_key: id
+    write_disposition: merge
+    partition_by: none   # explicit — merge tables of modest size; no auto-partition on an int cursor
+    incremental:
+      cursor_field: conversation_updated_at
+      cursor_type: int
+      lookback: 1h
+      initial_value: "1577836800"
+      ordered: true   # conversations are fetched in ascending updated_at order
+    schema:
+      - {name: id,                      type: STRING,  mode: REQUIRED}
+      - {name: conversation_id,         type: STRING,  mode: REQUIRED}
+      - {name: conversation_updated_at, type: INTEGER, mode: REQUIRED}
+      - {name: part_type,               type: STRING, description: "comment, note, assignment, open, close, ... or conversation_source for the opening message."}
+      - {name: body,                    type: STRING, description: "HTML body as Intercom returns it."}
+      - {name: created_at,              type: INTEGER}
+      - {name: updated_at,              type: INTEGER}
+      - {name: notified_at,             type: INTEGER}
+      - {name: author,                  type: JSON, description: "{type: admin|user|bot|team, id, name, email}"}
+      - {name: assigned_to,             type: JSON}
+      - {name: attachments,             type: JSON}
+      - {name: external_id,             type: STRING}
+      - {name: redacted,                type: BOOLEAN}
+      - {name: delivered_as,            type: STRING, description: "conversation_source rows only."}
+      - {name: subject,                 type: STRING, description: "conversation_source rows only."}
+
+  # ---------------------------------------------------------------------
+  # Dimensions and small catalogs
+  # ---------------------------------------------------------------------
+  - name: companies
+    table: companies
+    primary_key: id
+    write_disposition: merge
+    schema:
+      - {name: id,                type: STRING, mode: REQUIRED}
+      - {name: type,              type: STRING}
+      - {name: company_id,        type: STRING, description: "Your own identifier for the company."}
+      - {name: name,              type: STRING}
+      - {name: app_id,            type: STRING}
+      - {name: plan,              type: JSON}
+      - {name: size,              type: INTEGER}
+      - {name: industry,          type: STRING}
+      - {name: website,           type: STRING}
+      - {name: monthly_spend,     type: FLOAT}
+      - {name: user_count,        type: INTEGER}
+      - {name: session_count,     type: INTEGER}
+      - {name: created_at,        type: INTEGER}
+      - {name: updated_at,        type: INTEGER}
+      - {name: remote_created_at, type: INTEGER}
+      - {name: last_request_at,   type: INTEGER}
+      - {name: custom_attributes, type: JSON}
+      - {name: tags,              type: JSON}
+      - {name: segments,          type: JSON}
+
+  - name: admins
+    table: admins
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,                  type: STRING, mode: REQUIRED}
+      - {name: type,                type: STRING}
+      - {name: name,                type: STRING}
+      - {name: email,               type: STRING}
+      - {name: job_title,           type: STRING}
+      - {name: away_mode_enabled,   type: BOOLEAN}
+      - {name: away_mode_reassign,  type: BOOLEAN}
+      - {name: has_inbox_seat,      type: BOOLEAN}
+      - {name: team_ids,            type: JSON}
+      - {name: avatar,              type: JSON}
+      - {name: team_priority_level, type: JSON}
+
+  - name: teams
+    table: teams
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,        type: STRING, mode: REQUIRED}
+      - {name: type,      type: STRING}
+      - {name: name,      type: STRING}
+      - {name: admin_ids, type: JSON}
+      - {name: admin_priority_level, type: JSON}
+
+  - name: tags
+    table: tags
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,   type: STRING, mode: REQUIRED}
+      - {name: type, type: STRING}
+      - {name: name, type: STRING}
+
+  - name: segments
+    table: segments
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,          type: STRING, mode: REQUIRED}
+      - {name: type,        type: STRING}
+      - {name: name,        type: STRING}
+      - {name: person_type, type: STRING}
+      - {name: count,       type: INTEGER}
+      - {name: created_at,  type: INTEGER}
+      - {name: updated_at,  type: INTEGER}
+
+  - name: ticket_types
+    table: ticket_types
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,                     type: STRING, mode: REQUIRED}
+      - {name: type,                   type: STRING}
+      - {name: name,                   type: STRING}
+      - {name: description,            type: STRING}
+      - {name: category,               type: STRING}
+      - {name: icon,                   type: STRING}
+      - {name: archived,               type: BOOLEAN}
+      - {name: is_internal,            type: BOOLEAN}
+      - {name: workspace_id,           type: STRING}
+      - {name: created_at,             type: INTEGER}
+      - {name: updated_at,             type: INTEGER}
+      - {name: ticket_type_attributes, type: JSON}
+
+  - name: data_attributes
+    table: data_attributes
+    primary_key: [model, full_name]
+    write_disposition: replace
+    schema:
+      - {name: id,                 type: INTEGER}
+      - {name: model,              type: STRING, mode: REQUIRED}
+      - {name: full_name,          type: STRING, mode: REQUIRED}
+      - {name: name,               type: STRING}
+      - {name: label,              type: STRING}
+      - {name: description,        type: STRING}
+      - {name: data_type,          type: STRING}
+      - {name: custom,             type: BOOLEAN}
+      - {name: archived,           type: BOOLEAN}
+      - {name: api_writable,       type: BOOLEAN}
+      - {name: ui_writable,        type: BOOLEAN}
+      - {name: messenger_writable, type: BOOLEAN}
+      - {name: options,            type: JSON}
+      - {name: created_at,         type: INTEGER}
+      - {name: updated_at,         type: INTEGER}
+
+  - name: articles
+    table: articles
+    primary_key: id
+    write_disposition: merge
+    schema:
+      - {name: id,                 type: STRING, mode: REQUIRED}
+      - {name: type,               type: STRING}
+      - {name: workspace_id,       type: STRING}
+      - {name: title,              type: STRING}
+      - {name: description,        type: STRING}
+      - {name: body,               type: STRING}
+      - {name: author_id,          type: INTEGER}
+      - {name: state,              type: STRING}
+      - {name: parent_id,          type: INTEGER}
+      - {name: parent_ids,         type: JSON}
+      - {name: parent_type,        type: STRING}
+      - {name: default_locale,     type: STRING}
+      - {name: url,                type: STRING}
+      - {name: created_at,         type: INTEGER}
+      - {name: updated_at,         type: INTEGER}
+      - {name: statistics,         type: JSON}
+      - {name: translated_content, type: JSON}
+
+schedule: "0 * * * *"

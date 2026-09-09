@@ -10,6 +10,35 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-09-09
+
+### Added
+
+- **`intercom` baked source connector** (REST API v2.16; US / EU / AU
+  hosts). Twelve streams in the column shapes Airbyte's `source-intercom`
+  produces (top-level scalars as columns, nested objects as JSON,
+  unix-second timestamps as INTEGER), so a dbt project can move its
+  `source()` schema without touching models:
+  - `contacts`, `conversations`, `tickets` — `POST /<resource>/search`
+    windowed on `updated_at` (`window_days`, default 7), one page per
+    batch, `merge` on id, `ordered: true` with the cursor observed per
+    *completed* window so a mid-run flush never persists a value inside a
+    window still being walked. `tickets` flattens the 2.12+ `ticket_state`
+    object into `ticket_state` (category) plus the id and internal /
+    external labels.
+  - `conversation_parts` — the transcript: `GET /conversations/{id}` for
+    every conversation updated in the window, one row per part plus a
+    `conversation_source` row for the opening message; conversations are
+    fetched in ascending `updated_at` order and `max_conversations_per_run`
+    caps a backfill into resumable chunks.
+  - `companies` (`GET /companies/scroll`, merge), `articles` (page-number
+    pagination, merge), and `replace` dimensions `admins`, `teams`, `tags`,
+    `segments`, `ticket_types`, `data_attributes`.
+  - Client: Bearer token + `Intercom-Version` header, token-bucket pacing,
+    429 waits for `X-RateLimit-Reset` (bounded), 5xx / connection retries
+    with backoff, Intercom's `[code] message` errors surfaced verbatim, the
+    token never logged.
+
 ## [0.11.0] — 2026-09-07
 
 ### Changed

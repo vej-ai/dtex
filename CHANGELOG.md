@@ -10,24 +10,6 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
-### Fixed
-
-- **BigQuery `merge` streams no longer orphan `__staging_*` tables.** The
-  target's schema evolution ran *between* the staging-table load and the
-  `try`/`finally` that drops it, so a failure there (a column type
-  conflict, or BigQuery's concurrent-modification / rate-limit errors on
-  table metadata — easy to hit when several streams evolve tables in one
-  dataset under `--threads N`) left a
-  `{target}__staging_{run_suffix}_{uuid}` table behind permanently. The
-  target is now evolved *before* the staging table is created, so every
-  failure path either predates the staging table or is inside the
-  `finally`. Staging tables are additionally created with a 24h
-  expiration, so BigQuery reaps the one case no `finally` can cover — the
-  process being killed mid-MERGE (SIGKILL / OOM / container eviction).
-  Orphans were harmless to correctness (the names are unique per batch, so
-  they never collide with a later run) but cluttered the dataset and cost
-  storage.
-
 ## [0.12.4] — 2026-09-10
 
 ### Fixed
@@ -52,6 +34,22 @@ For what is *planned* — versus what has shipped — see
   `_date_window` had no direct test coverage — the one test that touched it
   set `segments_lookback_days: 0`, which is exactly the value that makes the
   old and new behaviour agree; it now has tests for both ends of the window.
+
+- **BigQuery `merge` streams no longer orphan `__staging_*` tables.** The
+  target's schema evolution ran *between* the staging-table load and the
+  `try`/`finally` that drops it, so a failure there (a column type
+  conflict, or BigQuery's concurrent-modification / rate-limit errors on
+  table metadata — easy to hit when several streams evolve tables in one
+  dataset under `--threads N`) left a
+  `{target}__staging_{run_suffix}_{uuid}` table behind permanently. The
+  target is now evolved *before* the staging table is created, so every
+  failure path either predates the staging table or is inside the
+  `finally`. Staging tables are additionally created with a 24h
+  expiration, so BigQuery reaps the one case no `finally` can cover — the
+  process being killed mid-MERGE (SIGKILL / OOM / container eviction).
+  Orphans were harmless to correctness (the names are unique per batch, so
+  they never collide with a later run) but cluttered the dataset and cost
+  storage.
 
 ## [0.12.3] — 2026-09-10
 
@@ -1088,7 +1086,7 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.4...HEAD
 [0.12.4]: https://github.com/vej-ai/dtex/releases/tag/v0.12.4
 [0.12.3]: https://github.com/vej-ai/dtex/releases/tag/v0.12.3
 [0.12.2]: https://github.com/vej-ai/dtex/releases/tag/v0.12.2

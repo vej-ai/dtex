@@ -28,8 +28,8 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import UTC, date, datetime, timedelta
 from collections.abc import Iterator
+from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -650,6 +650,21 @@ def test_oauth_secrets_never_appear_in_logs(
 # real consent was completed in a browser and the token still could not be
 # minted, because the loopback server had already closed.
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def free_tcp_port() -> int:
+    """A port no one is listening on.
+
+    Local rather than pytest-asyncio's fixture of the same name: that plugin
+    is not a declared test dependency, so relying on it passes wherever it
+    happens to be installed and errors in a clean venv (and in CI).
+    """
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
 
 
 def _capture_in_thread(port: int, state: str, timeout: int) -> dict[str, Any]:

@@ -10,6 +10,27 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.12.5] — 2026-09-10
+
+### Fixed
+
+- **`gads` cursors no longer freeze when a stream renames its date column.**
+  `_extract_gaql` found the last complete day with a hardcoded
+  `flat.get("date")` lookup. Every baked stream maps `segments.date` to a
+  column literally named `date`, so this always worked in-tree — but a
+  connector may map it to any name, and a project source matching an existing
+  warehouse table calls it `segments_date`. For those the lookup returned
+  `None`, `max_complete` was never set, `cursor.observe()` was never called,
+  and the cursor stayed pinned at `initial_value` forever. The run still
+  reported success, so the symptom was not an error but a pipeline that
+  re-pulled its **entire history on every run** — a 348k-row "incremental"
+  run, and a `stream_committed` event carrying `cursor_after=None`. The
+  column is now read from the register's declared
+  `incremental.cursor_field`, falling back to `"date"` only when a stream
+  declares no `incremental:` block. Anyone whose gads cursors show
+  `cursor_after=None` after a successful run was hitting this; the next run
+  on 0.12.5 advances them normally, with no state reset needed.
+
 ## [0.12.4] — 2026-09-10
 
 ### Fixed
@@ -1086,7 +1107,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.4...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.5...HEAD
+[0.12.5]: https://github.com/vej-ai/dtex/releases/tag/v0.12.5
 [0.12.4]: https://github.com/vej-ai/dtex/releases/tag/v0.12.4
 [0.12.3]: https://github.com/vej-ai/dtex/releases/tag/v0.12.3
 [0.12.2]: https://github.com/vej-ai/dtex/releases/tag/v0.12.2

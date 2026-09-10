@@ -335,6 +335,18 @@ def _extract_gaql(
     # settling, so we hold the floor at the day before today; the lookback
     # re-pulls today (and recent days) on the next run with corrected values.
     today = datetime.now(tz=UTC).date()
+    # The column holding the fact date, as this stream NAMES it. Read from the
+    # register's `incremental.cursor_field` rather than hardcoded to "date":
+    # a connector is free to map segments.date onto any column name (a project
+    # source matching an existing warehouse table calls it `segments_date`),
+    # and a hardcoded lookup silently returns None for those — leaving
+    # max_complete unset, so the cursor never advances and every run re-pulls
+    # the entire history while still reporting success.
+    cursor_column = (
+        stream_def.incremental.cursor_field
+        if stream_def.incremental is not None
+        else "date"
+    )
     max_complete: date | None = None
 
     batch: list[dict[str, Any]] = []
@@ -347,7 +359,7 @@ def _extract_gaql(
             rows_total += 1
 
             if cursor is not None:
-                day = flat.get("date")
+                day = flat.get(cursor_column)
                 if isinstance(day, str) and day:
                     day_d = date.fromisoformat(day)
                     if day_d < today and (max_complete is None or day_d > max_complete):

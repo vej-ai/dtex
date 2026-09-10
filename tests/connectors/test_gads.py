@@ -873,3 +873,44 @@ def test_date_window_never_starts_after_today() -> None:
     )
 
     assert since <= until == today
+
+
+def test_cursor_advances_when_the_date_column_is_not_named_date() -> None:
+    """The cursor reads the column the STREAM names, not a hardcoded "date".
+
+    Regression for a silent full-history re-pull (2026-09-10). `_extract_gaql`
+    looked up `flat.get("date")` to find the last complete day. Every baked
+    stream maps `segments.date` to a column literally called `date`, so the
+    bug was invisible here — but a connector may map it to any name, and a
+    project source matching an existing warehouse table calls it
+    `segments_date`. For those the lookup returned None, `max_complete` was
+    never set, and the cursor never advanced: every run re-pulled the entire
+    history from `segments_initial_since_date` while still reporting success
+    (`cursor_after=None`, and a 348k-row "incremental" run).
+    """
+    from dtex.sources.gads import source as gads_source
+
+    field_map = {"segments.date": "segments_date", "metrics.clicks": "clicks"}
+    row = {"segments": {"date": "2020-01-02"}, "metrics": {"clicks": "3"}}
+    flat = gads_source._flatten_row(row, field_map, "123")
+
+    # The flattened row carries the date under the stream's own column name.
+    assert flat["segments_date"] == "2020-01-02"
+    assert "date" not in flat, (
+        "this stream names the column segments_date; a hardcoded 'date' lookup "
+        "would find nothing and silently freeze the cursor"
+    )
+
+    # And the register's declared cursor_field is what names it.
+    incremental = _Incremental(cursor_field="segments_date")
+    resolved = (
+        incremental.cursor_field if incremental is not None else "date"
+    )
+    assert flat.get(resolved) == "2020-01-02"
+
+
+class _Incremental:
+    """Stand-in for the register's `incremental:` block."""
+
+    def __init__(self, cursor_field: str) -> None:
+        self.cursor_field = cursor_field

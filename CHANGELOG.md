@@ -28,6 +28,31 @@ For what is *planned* — versus what has shipped — see
   they never collide with a later run) but cluttered the dataset and cost
   storage.
 
+## [0.12.4] — 2026-09-10
+
+### Fixed
+
+- **`gads` incremental streams no longer skip their whole backfill.** The
+  date window was `max(cursor or segments_initial_since_date, today -
+  segments_lookback_days)`, which is wrong at both ends. On a **first run**
+  there is no cursor, so the initial start date was compared against
+  `today - lookback` and lost: a `segments_initial_since_date` of
+  2024-01-01 with a 14-day lookback backfilled only the last 14 days,
+  silently skipping 969 days of history. Worse, an account with no activity
+  in that trailing window (paused campaigns, a seasonal advertiser) produced
+  a run that "succeeded" with zero rows and looked like a healthy no-op. On a
+  **resumed run** the same `max()` always picked the cursor over
+  `cursor - lookback`, so the declared lookback re-pulled nothing at all and
+  Google Ads' late-landing conversions (view-through and modelled
+  conversions restate for weeks) were never picked up. A first run now uses
+  `segments_initial_since_date` verbatim, and a resumed run starts at
+  `cursor - lookback`; a cursor somehow ahead of today is clamped. Anyone
+  whose gads streams were first run with a lookback shorter than their
+  intended history should re-run those streams with the state reset.
+  `_date_window` had no direct test coverage — the one test that touched it
+  set `segments_lookback_days: 0`, which is exactly the value that makes the
+  old and new behaviour agree; it now has tests for both ends of the window.
+
 ## [0.12.3] — 2026-09-10
 
 ### Fixed
@@ -1064,6 +1089,7 @@ The first public release.
   the private-disclosure channel and response timelines.
 
 [Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.2...HEAD
+[0.12.4]: https://github.com/vej-ai/dtex/releases/tag/v0.12.4
 [0.12.3]: https://github.com/vej-ai/dtex/releases/tag/v0.12.3
 [0.12.2]: https://github.com/vej-ai/dtex/releases/tag/v0.12.2
 [0.12.1]: https://github.com/vej-ai/dtex/releases/tag/v0.12.1

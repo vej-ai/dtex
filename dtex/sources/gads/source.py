@@ -255,23 +255,41 @@ def _resolve_customer_ids(
 def _date_window(config: Config, cursor: Cursor) -> tuple[date, date]:
     """Compute the (since, until) date window for an incremental run.
 
-    ``since = max(cursor.start_value() or initial, today - lookback)``;
-    ``until = today``. The lookback re-pulls recent days; the cursor advances
-    only past complete days (handled in :func:`_extract_gaql`).
+    ``until = today``. ``since`` depends on whether state exists:
+
+    * **First run** (no cursor): ``segments_initial_since_date`` verbatim —
+      the whole declared history.
+    * **Resumed run**: ``cursor - lookback``, so recent days are re-pulled to
+      absorb late conversions and attribution restatements.
+
+    The cursor advances only past complete days (see :func:`_extract_gaql`).
     """
     today = datetime.now(tz=UTC).date()
     lookback = int(config.get("segments_lookback_days", 7))
 
     cursor_value = cursor.start_value()
     if cursor_value is None:
-        cursor_value = date.fromisoformat(
-            str(config.get("segments_initial_since_date", "2024-01-01"))
+        # No state: backfill from the configured start, NOT from
+        # today - lookback. This used to be `max(cursor_value, today -
+        # lookback)`, which on a first run picked the *later* of the two and
+        # so silently skipped the entire history — a 2024-01-01 initial date
+        # with a 14-day lookback backfilled only the last 14 days, and if the
+        # account had no activity in that window the run "succeeded" with
+        # zero rows.
+        return (
+            date.fromisoformat(
+                str(config.get("segments_initial_since_date", "2024-01-01"))
+            ),
+            today,
         )
-    elif isinstance(cursor_value, str):
+
+    if isinstance(cursor_value, str):
         cursor_value = date.fromisoformat(cursor_value)
 
-    since = max(cursor_value, today - timedelta(days=lookback))
-    return since, today
+    # Resumed: step BACK from the cursor by the lookback. The old max() form
+    # never re-pulled anything, because the cursor is always the later date.
+    since = cursor_value - timedelta(days=lookback)
+    return min(since, today), today
 
 
 def _extract_gaql(

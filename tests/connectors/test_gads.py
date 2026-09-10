@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import UTC, date, datetime, timedelta
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -772,3 +773,88 @@ def test_refresh_token_port_in_use_is_a_clear_error(
         assert "--port" in str(excinfo.value)
     finally:
         blocker.server_close()
+
+
+# ---------------------------------------------------------------------------
+# _date_window — which days an incremental run actually asks Google for.
+#
+# Regression coverage for a backfill that silently fetched nothing
+# (2026-09-10). The window was `max(cursor or initial, today - lookback)`,
+# which is wrong at BOTH ends: on a first run it picks today-minus-lookback
+# over the configured start date (skipping the whole history), and on a
+# resumed run it picks the cursor over cursor-minus-lookback (so the lookback
+# never re-pulls anything).
+# ---------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    """Minimal Cursor stand-in exposing just start_value()."""
+
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    def start_value(self) -> Any:
+        return self._value
+
+
+def test_date_window_first_run_backfills_the_whole_history() -> None:
+    """No cursor → the configured start date, not today-minus-lookback.
+
+    The old `max()` form backfilled only the last `lookback` days. With a
+    2024-01-01 start and a 14-day lookback that skipped 969 days; worse, if
+    the account had no activity in that window (paused campaigns) the run
+    "succeeded" with zero rows and looked like a healthy no-op.
+    """
+    from dtex.sources.gads.source import _date_window
+
+    since, until = _date_window(
+        _FakeConfig(
+            {"segments_initial_since_date": "2024-01-01", "segments_lookback_days": 14}
+        ),
+        _FakeCursor(None),
+    )
+
+    assert since == date(2024, 1, 1)
+    assert until == datetime.now(tz=UTC).date()
+
+
+def test_date_window_resumed_run_steps_back_by_the_lookback() -> None:
+    """A cursor → cursor minus lookback, so recent days are actually re-pulled.
+
+    Google Ads restates conversions for weeks (view-through and modelled
+    conversions land late). The old form returned the cursor itself, so the
+    declared lookback re-pulled nothing and late conversions were never seen.
+    """
+    from dtex.sources.gads.source import _date_window
+
+    since, _ = _date_window(
+        _FakeConfig({"segments_lookback_days": 14}),
+        _FakeCursor(date(2026, 9, 5)),
+    )
+
+    assert since == date(2026, 8, 22)
+
+
+def test_date_window_accepts_a_string_cursor() -> None:
+    """State round-trips through JSON, so the cursor can come back as a str."""
+    from dtex.sources.gads.source import _date_window
+
+    since, _ = _date_window(
+        _FakeConfig({"segments_lookback_days": 7}),
+        _FakeCursor("2026-09-05"),
+    )
+
+    assert since == date(2026, 8, 29)
+
+
+def test_date_window_never_starts_after_today() -> None:
+    """A cursor in the future (clock skew, a bad manual state edit) is clamped."""
+    from dtex.sources.gads.source import _date_window
+
+    today = datetime.now(tz=UTC).date()
+    since, until = _date_window(
+        _FakeConfig({"segments_lookback_days": 0}),
+        _FakeCursor(today + timedelta(days=30)),
+    )
+
+    assert since <= until == today

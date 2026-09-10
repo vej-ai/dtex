@@ -28,7 +28,8 @@ Command surface:
   and config.
 * ``dtex init [<dir>]`` — scaffold a new project tree.
 * ``dtex new {{source,destination,config}} <name>`` — scaffold one folder/file.
-* ``dtex state list -p <config>`` / ``dtex state reset -p <config>
+* ``dtex state list -p <config>`` / ``dtex state set -p <config>``
+  / ``dtex state reset -p <config>
   [--stream S]`` — inspect / clear incremental state.
 * ``dtex --version`` — print the version.
 """
@@ -67,7 +68,7 @@ from dtex.cli._scaffold import (
     scaffold_source,
 )
 from dtex.cli._secrets import check_project as _check_secrets_project
-from dtex.cli._state import StateError, list_state, reset_state
+from dtex.cli._state import StateError, list_state, reset_state, set_state
 from dtex.engine import ConfigError, DiscoveryError, EngineError
 from dtex.engine import config as cfg
 from dtex.engine import discovery as disc
@@ -914,6 +915,95 @@ def state_reset(
         click.style(
             f"reset state for config {config!r} ({scope}): "
             f"{cleared} cursor row(s) cleared",
+            fg="green",
+        )
+    )
+
+
+@state.command(name="set")
+@click.option(
+    "-p",
+    "--conf",
+    "config",
+    required=True,
+    metavar="CONFIG",
+    help="Pipeline config name.",
+)
+@click.option(
+    "--stream",
+    "stream_name",
+    required=True,
+    help="The stream whose cursor to set.",
+)
+@click.option(
+    "--cursor",
+    "cursor",
+    required=True,
+    metavar="VALUE",
+    help="New cursor value, in the stream's declared cursor_type "
+    "(YYYY-MM-DD for date, ISO-8601 for timestamp, an integer for int).",
+)
+@click.option(
+    "--target", "target", help="Override the config's target for this write."
+)
+@click.option(
+    "--project-dir",
+    "project_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Project root. Defaults to the current directory.",
+)
+@click.option(
+    "--destination-param",
+    "destination_params",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Override a destination config value. Repeatable.",
+)
+def state_set(
+    config: str,
+    stream_name: str,
+    cursor: str,
+    target: str | None,
+    project_dir: Path | None,
+    destination_params: tuple[str, ...],
+) -> None:
+    """Set one stream's cursor without re-extracting anything.
+
+    The counterpart to ``reset``: reset throws state away so the next run
+    re-pulls from ``initial_value``, whereas ``set`` moves the cursor to a
+    value you already know is correct. The usual case is data that is
+    *already* loaded while the cursor was lost or never advanced — a state
+    table restored from backup, a destination migration, or a connector bug
+    that failed to observe the cursor. Re-extracting years of history to
+    rediscover a date you can read off the loaded rows is pure waste.
+
+    The value is validated against the stream's declared ``cursor_type``
+    before anything is written, and the stream must exist in the source
+    manifest, so a typo writes nothing. ``state_blob`` (the resume pointer
+    for ``ordered`` streams), ``rows_total`` and ``last_run_id`` are
+    preserved.
+
+    Loaded data is never touched — this only moves where the next run starts.
+    """
+    dest_params = _parse_kv("destination-param", destination_params)
+    try:
+        record = set_state(
+            config,
+            stream=stream_name,
+            cursor=cursor,
+            project_dir=project_dir,
+            target=target,
+            destination_params=dest_params or None,
+        )
+    except _FRIENDLY_ERRORS as exc:
+        _fail(str(exc), code=2)
+        return  # unreachable.
+
+    click.echo(
+        click.style(
+            f"set cursor for config {config!r} stream {stream_name!r}: "
+            f"{record.cursor_value!r} "
+            f"({record.cursor_type.value if record.cursor_type else 'untyped'})",
             fg="green",
         )
     )

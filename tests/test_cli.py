@@ -961,6 +961,195 @@ def test_state_reset_never_run_is_clean(
 
 
 # ==========================================================================
+# `dtex state set` — move a cursor without re-extracting
+# ==========================================================================
+
+
+def _state_set(
+    runner: CliRunner, cli_project: Path, warehouse: str, *args: str
+):
+    return runner.invoke(
+        cli,
+        [
+            "state",
+            "set",
+            "-p",
+            "echo_dev",
+            "--project-dir",
+            str(cli_project),
+            "--destination-param",
+            f"path={warehouse}",
+            *args,
+        ],
+    )
+
+
+def test_state_set_moves_the_cursor(
+    runner: CliRunner, cli_project: Path, warehouse: str
+) -> None:
+    """``state set`` writes the cursor, and the next run resumes from it."""
+    run_args = [
+        "run",
+        "-p",
+        "echo_dev",
+        "--project-dir",
+        str(cli_project),
+        "--destination-param",
+        f"path={warehouse}",
+    ]
+    runner.invoke(cli, run_args)
+
+    result = _state_set(
+        runner, cli_project, warehouse, "--stream", "items", "--cursor", "99"
+    )
+    assert result.exit_code == 0, _show(result)
+    assert "99" in result.output
+
+    listed = runner.invoke(
+        cli,
+        [
+            "state",
+            "list",
+            "-p",
+            "echo_dev",
+            "--project-dir",
+            str(cli_project),
+            "--destination-param",
+            f"path={warehouse}",
+        ],
+    )
+    assert "99" in listed.output
+
+
+def test_state_set_rejects_an_unknown_stream(
+    runner: CliRunner, cli_project: Path, warehouse: str
+) -> None:
+    """A typo'd stream writes nothing and lists what is actually declared.
+
+    Creating the row anyway would leave an orphan the engine never reads,
+    while the real stream kept re-extracting — a silent no-op.
+    """
+    result = _state_set(
+        runner, cli_project, warehouse, "--stream", "itemz", "--cursor", "5"
+    )
+    assert result.exit_code == 2
+    assert "itemz" in result.output
+    assert "items" in result.output  # names the declared streams
+
+
+def test_state_set_rejects_a_non_incremental_stream(
+    runner: CliRunner, cli_project: Path, warehouse: str
+) -> None:
+    """A stream with no `incremental:` block has no cursor to set."""
+    result = _state_set(
+        runner, cli_project, warehouse, "--stream", "events", "--cursor", "5"
+    )
+    assert result.exit_code == 2
+    assert "not incremental" in result.output
+
+
+def test_state_set_validates_against_the_declared_cursor_type(
+    runner: CliRunner, cli_project: Path, warehouse: str
+) -> None:
+    """A value of the wrong type is refused before anything is written.
+
+    `items` declares cursor_type: int. Storing "banana" would round-trip
+    through the state table's JSON column and break the next run's
+    comparison, so it is rejected at the CLI.
+    """
+    result = _state_set(
+        runner, cli_project, warehouse, "--stream", "items", "--cursor", "banana"
+    )
+    assert result.exit_code == 2
+    assert "int" in result.output
+
+
+def test_state_set_preserves_the_rest_of_the_row(
+    runner: CliRunner, cli_project: Path, warehouse: str
+) -> None:
+    """Setting a cursor keeps rows_total / state_blob / last_run_id.
+
+    state_blob carries the mid-stream resume pointer for `ordered` streams;
+    dropping it would strand a partially-walked stream.
+    """
+    from dtex.cli._state import list_state, set_state
+
+    run_args = [
+        "run",
+        "-p",
+        "echo_dev",
+        "--project-dir",
+        str(cli_project),
+        "--destination-param",
+        f"path={warehouse}",
+    ]
+    runner.invoke(cli, run_args)
+
+    before = {
+        r.stream: r
+        for r in list_state(
+            "echo_dev",
+            project_dir=cli_project,
+            destination_params={"path": warehouse},
+        )
+    }["items"]
+
+    set_state(
+        "echo_dev",
+        stream="items",
+        cursor="1234",
+        project_dir=cli_project,
+        destination_params={"path": warehouse},
+    )
+
+    after = {
+        r.stream: r
+        for r in list_state(
+            "echo_dev",
+            project_dir=cli_project,
+            destination_params={"path": warehouse},
+        )
+    }["items"]
+
+    assert after.cursor_value == 1234
+    assert after.rows_total == before.rows_total
+    assert after.state_blob == before.state_blob
+    assert after.last_run_id == before.last_run_id
+
+
+def test_state_set_parses_a_date_cursor() -> None:
+    """A `date` cursor normalises to a bare ISO date, never a datetime.
+
+    Stored as "2026-08-18T00:00:00" it would compare wrong against
+    date.fromisoformat on the next run.
+    """
+    from dtex.cli._state import _parse_cursor
+    from dtex.types import CursorType
+
+    assert _parse_cursor("2026-08-18", CursorType.DATE) == "2026-08-18"
+
+    with pytest.raises(Exception, match="ISO date"):
+        _parse_cursor("18/08/2026", CursorType.DATE)
+
+
+def test_state_set_parses_a_timestamp_cursor() -> None:
+    """A `timestamp` cursor accepts ISO, a trailing Z, and a bare date."""
+    from dtex.cli._state import _parse_cursor
+    from dtex.types import CursorType
+
+    assert _parse_cursor(
+        "2026-08-18T12:30:00+00:00", CursorType.TIMESTAMP
+    ).startswith("2026-08-18T12:30:00")
+    assert _parse_cursor("2026-08-18T12:30:00Z", CursorType.TIMESTAMP).startswith(
+        "2026-08-18T12:30:00"
+    )
+    # A bare date is a legitimate shorthand for midnight UTC.
+    assert _parse_cursor("2026-08-18", CursorType.TIMESTAMP).startswith(
+        "2026-08-18T00:00:00"
+    )
+
+
+# ==========================================================================
 # Stage 8e — `dtex run --threads N`
 # ==========================================================================
 

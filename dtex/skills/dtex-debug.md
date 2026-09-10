@@ -114,6 +114,30 @@ ignores the cursor for this invocation but leaves the row intact.
 If you actually want to clear state for everyone, use
 `dtex state reset <stream>` — that's the explicit operation.
 
+### "The data is loaded but the cursor is wrong, and I don't want to re-pull"
+
+A cursor can be lost or left behind while the rows themselves are fine — a
+state table restored from backup, a destination migration, or a connector bug
+that never observed the cursor. `state reset` is the wrong tool: it clears
+state so the next run re-extracts from `initial_value`, which for a
+multi-year history is hours of API calls to rediscover a date you can read off
+the loaded rows.
+
+Set it directly instead:
+
+```bash
+dtex state set -p <config> --stream <stream> --cursor 2026-08-18
+```
+
+The value is validated against the stream's declared `cursor_type`, an unknown
+stream is refused (with the declared names listed), and `state_blob` /
+`rows_total` / `last_run_id` are preserved. Loaded data is never touched — this
+only moves where the next run starts.
+
+The telltale that you need this: a "successful" incremental run that extracts
+far more rows than the window should contain, and a `stream_committed` event
+carrying `cursor_after=None`.
+
 ## 5. Iterating quickly
 
 ```bash

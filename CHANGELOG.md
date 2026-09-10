@@ -10,6 +10,37 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.12.6] — 2026-09-10
+
+### Added
+
+- **`dtex state set -p <config> --stream <s> --cursor <value>`** — move one
+  stream's cursor without re-extracting anything. The counterpart to
+  `state reset`: reset throws state away so the next run re-pulls from
+  `initial_value`, while `set` moves the cursor to a value you already know
+  is correct. The motivating case is data that is *already* loaded while the
+  cursor was lost or never advanced — a state table restored from backup, a
+  destination migration, or a connector bug that failed to observe the
+  cursor. Without this the only recovery was re-extracting the full history
+  to rediscover a date readable off the loaded rows; one such pipeline faced
+  a 4-hour re-pull of 2.6 years to recover a single known date.
+
+  Unlike `reset`, which reaches past the hook contract to issue a DELETE and
+  so works only on SQL-backed destinations, `set` goes through the
+  destination's own `commit_state` hook — so it works on every Tier-A
+  destination, BigQuery included.
+
+  The value is validated against the stream's **declared** `cursor_type`
+  before anything is written: a `date` cursor must be `YYYY-MM-DD` (storing
+  `2026-08-18T00:00:00` would compare wrong against `date.fromisoformat` on
+  the next run), a `timestamp` accepts ISO-8601, a trailing `Z`, or a bare
+  date as midnight UTC, and an `int` must parse as an integer. An unknown
+  stream is refused with the list of declared streams rather than writing an
+  orphan row the engine would never read, and a non-incremental stream is
+  refused outright. `state_blob` — the mid-stream resume pointer for
+  `ordered` streams — plus `rows_total` and `last_run_id` are preserved, so
+  setting a cursor never strands a partially-walked stream.
+
 ## [0.12.5] — 2026-09-10
 
 ### Fixed
@@ -1107,7 +1138,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.5...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.6...HEAD
+[0.12.6]: https://github.com/vej-ai/dtex/releases/tag/v0.12.6
 [0.12.5]: https://github.com/vej-ai/dtex/releases/tag/v0.12.5
 [0.12.4]: https://github.com/vej-ai/dtex/releases/tag/v0.12.4
 [0.12.3]: https://github.com/vej-ai/dtex/releases/tag/v0.12.3

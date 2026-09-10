@@ -376,7 +376,10 @@ per the catalog row above:
    - `merge` → a per-batch staging table `{target}__staging_{run_suffix}_{uuid}`,
      `WRITE_TRUNCATE`; then run `MERGE INTO target USING staging ON pk
      WHEN MATCHED UPDATE ... WHEN NOT MATCHED INSERT ...`; then drop
-     the staging table in a `finally`.
+     the staging table in a `finally`. The target's schema is evolved
+     *before* the staging table is created, so a failure there cannot
+     orphan one; the staging table also carries a 24h expiration as a
+     backstop for a process killed mid-MERGE, where no `finally` runs.
 4. Wait for job completion with exponential-backoff retry on transient
    `429 / 500 / 502 / 503 / 504`. A non-retryable 4xx surfaces
    immediately.

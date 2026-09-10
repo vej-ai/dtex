@@ -55,7 +55,7 @@ import json
 import logging
 import uuid
 from collections.abc import Iterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Any
 
@@ -142,6 +142,14 @@ _RUNS_TABLE = "_dtex_runs"
 # The engine-owned stream-lease table — docs/05 §5.5. One row per
 # (connector, stream); same ``_dtex_`` namespace. Created lazily.
 _LEASE_TABLE = "_dtex_leases"
+
+# Backstop TTL on per-batch MERGE staging tables. The ``finally`` in
+# _merge_via_staging is the primary cleanup; this covers only the case no
+# ``finally`` can — the process dying mid-MERGE (SIGKILL / OOM / eviction),
+# which otherwise leaves a ``{target}__staging_*`` table in the dataset
+# forever. Comfortably longer than any single batch's MERGE, so it never
+# expires a table still in use.
+_STAGING_TABLE_TTL_HOURS = 24
 
 
 # --------------------------------------------------------------------------
@@ -487,7 +495,9 @@ def write_batch(conn: BQConn, batch: Batch, stream: StreamMeta) -> int:
     * ``merge`` — LOAD job with ``WRITE_TRUNCATE`` into a per-batch staging
       table ``{target}__staging_{run_suffix}_{uuid}``, then ``MERGE INTO
       target USING staging ON pk``, then drop the staging table in a
-      ``finally`` (cleanup on both success and failure).
+      ``finally`` (cleanup on both success and failure). The target's
+      schema is evolved before the staging table exists, and the staging
+      table carries a TTL — see :func:`_merge_via_staging`.
     * ``replace`` — first batch of the run uses ``WRITE_TRUNCATE`` (clears
       the table, loads); subsequent batches in the SAME run use
       ``WRITE_APPEND`` so a multi-batch replace stream truncates exactly
@@ -729,7 +739,13 @@ def _upload_blob(conn: BQConn, table_name: str, parquet_bytes: bytes) -> tuple[s
     return uri, blob
 
 
-def _ensure_load_target(conn: BQConn, table_name: str, schema: Schema) -> None:
+def _ensure_load_target(
+    conn: BQConn,
+    table_name: str,
+    schema: Schema,
+    *,
+    expires_after_hours: int | None = None,
+) -> None:
     """Create ``table_name`` with ``schema`` if absent; add any missing columns.
 
     # NOTE: this exists because the LOAD job carries *no inline schema*.
@@ -740,6 +756,13 @@ def _ensure_load_target(conn: BQConn, table_name: str, schema: Schema) -> None:
     # conversion). So every load target — including per-batch merge staging
     # tables — is created/patched through the tables API first, and the LOAD
     # maps Parquet columns to the table by name.
+
+    ``expires_after_hours`` stamps a table expiration at creation time —
+    used for per-batch MERGE staging tables. The ``finally`` drop is the
+    primary cleanup; the expiration is the backstop for the one case no
+    ``finally`` can cover (SIGKILL / OOM / container eviction mid-MERGE),
+    where BigQuery reaps the orphan itself. Never pass it for a real target
+    table.
     """
     bq = _bigquery_module()
     client = conn.client
@@ -750,7 +773,12 @@ def _ensure_load_target(conn: BQConn, table_name: str, schema: Schema) -> None:
         table = client.bq.get_table(ref)
     except Exception as exc:  # noqa: BLE001 — narrowed by status-code check below
         if _status_code(exc) == 404 or _is_not_found(exc):
-            client.bq.create_table(bq.Table(ref, schema=bq_schema(schema)))
+            new_table = bq.Table(ref, schema=bq_schema(schema))
+            if expires_after_hours is not None:
+                new_table.expires = datetime.now(UTC) + timedelta(
+                    hours=expires_after_hours
+                )
+            client.bq.create_table(new_table)
             return
         raise
     have = {f.name for f in table.schema}
@@ -791,6 +819,7 @@ def _load_to_table(
     schema: Schema,
     *,
     disposition: str,
+    expires_after_hours: int | None = None,
 ) -> None:
     """Stage a Parquet object in GCS and run a LOAD job into ``table_name``.
 
@@ -804,11 +833,16 @@ def _load_to_table(
     ``WRITE_TRUNCATE`` disposition is implemented as an explicit ``TRUNCATE
     TABLE`` followed by an append-load, so the table schema — not the
     Parquet-inferred one — stays authoritative.
+
+    ``expires_after_hours`` is forwarded to :func:`_ensure_load_target` —
+    set by the MERGE staging path only, as an orphan backstop.
     """
     bq = _bigquery_module()
     client = conn.client
 
-    _ensure_load_target(conn, table_name, schema)
+    _ensure_load_target(
+        conn, table_name, schema, expires_after_hours=expires_after_hours
+    )
     if disposition == "WRITE_TRUNCATE":
         _truncate_table(conn, table_name)
     if not batch:
@@ -876,6 +910,13 @@ def _merge_via_staging(
     leaves nothing behind, and a failed MERGE leaves nothing behind in BQ
     either (the GCS Parquet stays, per the forensics rule). Without the
     drop a failed run would leak a per-batch staging table per attempt.
+
+    Two further guards against orphaned ``{target}__staging_*`` tables:
+    the target's schema is evolved *before* the staging table is created
+    (so the one fallible step that used to sit between the load and the
+    ``finally`` can no longer orphan one), and the staging table is
+    created with a ``_STAGING_TABLE_TTL_HOURS`` expiration so BigQuery
+    reaps it if the process dies mid-MERGE and no ``finally`` ever runs.
     """
     bq = _bigquery_module()
     client = conn.client
@@ -886,17 +927,30 @@ def _merge_via_staging(
     staging_name = f"{target_table}__staging_{client.run_suffix}_{uuid.uuid4().hex[:8]}"
     validate_identifier(staging_name, kind="table")
 
+    # The MERGE references every column of ``schema`` — including columns
+    # the batch introduced beyond the declared stream schema (the ``evolve``
+    # default). The staging table gets them via its own _ensure_load_target;
+    # the *target* must be evolved too, or the MERGE 400s with
+    # "Unrecognized name: <new column>".
+    #
+    # This runs BEFORE the staging load on purpose: it is the one step here
+    # that can fail while a staging table already exists. Evolving the
+    # target first means every failure path either predates the staging
+    # table or is inside the try/finally that drops it — no orphan
+    # ``{target}__staging_*`` left behind in the dataset.
+    _ensure_load_target(conn, target_table, schema)
+
     # Stage the batch — the staging table name embeds a fresh uuid, so the
     # table cannot pre-exist; a plain append-load is sufficient (and skips
     # the TRUNCATE round-trip a WRITE_TRUNCATE disposition now implies).
-    _load_to_table(conn, staging_name, batch, schema, disposition="WRITE_APPEND")
-
-    # The MERGE references every column of ``schema`` — including columns
-    # the batch introduced beyond the declared stream schema (the ``evolve``
-    # default). The staging table got them via its own _ensure_load_target;
-    # the *target* must be evolved too, or the MERGE 400s with
-    # "Unrecognized name: <new column>".
-    _ensure_load_target(conn, target_table, schema)
+    _load_to_table(
+        conn,
+        staging_name,
+        batch,
+        schema,
+        disposition="WRITE_APPEND",
+        expires_after_hours=_STAGING_TABLE_TTL_HOURS,
+    )
 
     try:
         columns = tuple(f.name for f in schema.fields)

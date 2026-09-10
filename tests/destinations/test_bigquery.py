@@ -253,6 +253,9 @@ class _FakeTable:
         # destination requests one. Either time or range, never both.
         self.time_partitioning: _FakeTimePartitioning | None = None
         self.range_partitioning: _FakeRangePartitioning | None = None
+        # Table expiration — set by _ensure_load_target for MERGE staging
+        # tables (the orphan backstop). None on every ordinary target.
+        self.expires: datetime | None = None
 
 
 class _FakeTimePartitioning:
@@ -1380,6 +1383,77 @@ def test_write_batch_merge_drops_staging_even_on_merge_failure(
     assert len(bq.load_jobs) == 1
     staging_table = bq.load_jobs[0]["table"]
     assert staging_table in bq.deleted_tables
+
+
+def test_write_batch_merge_target_evolution_failure_leaves_no_staging_table(
+    bigquery_destination: LoadedConnector,
+    fake_bq: _FakeBigQueryModule,
+    fake_gcs: type[_FakeStorageClient],
+) -> None:
+    """A failure evolving the TARGET must not orphan a staging table.
+
+    Regression: target evolution used to run *between* the staging LOAD and
+    the try/finally that drops the staging table, so an update_table error
+    (type conflict, concurrent-modification, rate limit) left a
+    ``{target}__staging_*`` table behind in the dataset forever. Evolving
+    the target first means the failure predates the staging table.
+    """
+    conn = _open_with_fakes(bigquery_destination)
+    hooks = _hooks(bigquery_destination)
+    hooks["ensure_schema"](conn, _events_meta())
+
+    bq = conn.client.bq
+
+    # Fail the schema-evolution patch of the target table.
+    def _boom(table: _FakeTable, fields: list[str]) -> _FakeTable:
+        raise _NonRetryableError("cannot relax field mode")
+
+    bq.update_table = _boom  # type: ignore[method-assign]
+
+    # A batch carrying an undeclared column forces the target evolution.
+    meta = _events_meta(WriteDisposition.MERGE, primary_key=("id",))
+    with pytest.raises(_NonRetryableError):
+        hooks["write_batch"](conn, [{"id": 1, "name": "a", "extra": "x"}], meta)
+
+    # No staging table was ever created, so none can be orphaned.
+    staging_created = [
+        t.table_id for t in bq.created_tables if "__staging_" in t.table_id
+    ]
+    assert staging_created == []
+    # And nothing staging-shaped survives in the dataset.
+    assert [k for k in bq._tables if "__staging_" in k] == []
+
+
+def test_write_batch_merge_staging_table_carries_expiration(
+    bigquery_destination: LoadedConnector,
+    fake_bq: _FakeBigQueryModule,
+    fake_gcs: type[_FakeStorageClient],
+) -> None:
+    """The MERGE staging table is created with a TTL — the orphan backstop.
+
+    The ``finally`` drop is the primary cleanup, but it cannot run if the
+    process is SIGKILLed / OOM-killed mid-MERGE. The expiration lets
+    BigQuery reap that orphan; ordinary target tables never get one.
+    """
+    conn = _open_with_fakes(bigquery_destination)
+    hooks = _hooks(bigquery_destination)
+    hooks["ensure_schema"](conn, _events_meta())
+
+    before = datetime.now(UTC)
+    meta = _events_meta(WriteDisposition.MERGE, primary_key=("id",))
+    hooks["write_batch"](conn, [{"id": 1, "name": "a"}], meta)
+
+    bq = conn.client.bq
+    staging = [t for t in bq.created_tables if "__staging_" in t.table_id]
+    assert len(staging) == 1
+    expires = staging[0].expires
+    assert expires is not None
+    # Roughly a day out — comfortably past any single batch's MERGE.
+    assert timedelta(hours=23) < expires - before < timedelta(hours=25)
+
+    # The target table itself is never given an expiration.
+    target = bq._tables["events"]
+    assert target.expires is None
 
 
 def test_write_batch_merge_requires_primary_key(

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -639,3 +640,135 @@ def test_oauth_secrets_never_appear_in_logs(
     full_log = "\n".join(record.getMessage() for record in caplog.records)
     for v in secrets.values():
         assert v not in full_log, f"OAuth secret {v!r} leaked into logs"
+
+
+# ---------------------------------------------------------------------------
+# get_refresh_token — the one-shot OAuth helper.
+#
+# Regression coverage for three defects found in the field (2026-09-10): a
+# real consent was completed in a browser and the token still could not be
+# minted, because the loopback server had already closed.
+# ---------------------------------------------------------------------------
+
+
+def _capture_in_thread(port: int, state: str, timeout: int) -> dict[str, Any]:
+    """Run _capture_code off-thread and report what it returned or raised."""
+    from dtex.sources.gads.scripts import get_refresh_token as grt
+
+    out: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            out["code"] = grt._capture_code(
+                f"http://localhost:{port}/",
+                "http://example.invalid/consent",
+                port,
+                state,
+                timeout,
+            )
+        except SystemExit as exc:
+            out["err"] = str(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    out["_thread"] = thread
+    return out
+
+
+def _get(url: str) -> int:
+    """GET a URL, returning the status code (including for 4xx)."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            return int(resp.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+
+
+@pytest.fixture()
+def _no_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never launch a real browser from a test."""
+    from dtex.sources.gads.scripts import get_refresh_token as grt
+
+    monkeypatch.setattr(grt.webbrowser, "open", lambda *a, **k: True)
+
+
+def test_refresh_token_favicon_does_not_consume_the_callback(
+    _no_browser: None, free_tcp_port: int
+) -> None:
+    """A /favicon.ico probe must not end the wait for the real redirect.
+
+    The helper used to call handle_request() exactly once, so the FIRST HTTP
+    request of any kind closed the server. Browsers routinely ask for
+    /favicon.ico, which meant the genuine callback then hit a dead port and
+    the user saw ERR_CONNECTION_REFUSED with a valid code in the URL bar.
+    """
+    result = _capture_in_thread(free_tcp_port, "STATE123", timeout=20)
+    time.sleep(0.5)  # let the server bind
+
+    assert _get(f"http://127.0.0.1:{free_tcp_port}/favicon.ico") == 404
+    assert _get(f"http://127.0.0.1:{free_tcp_port}/") == 404
+
+    assert (
+        _get(f"http://127.0.0.1:{free_tcp_port}/?code=REALCODE&state=STATE123")
+        == 200
+    )
+    result["_thread"].join(10)
+
+    assert result.get("code") == "REALCODE", result
+
+
+def test_refresh_token_rejects_state_mismatch(
+    _no_browser: None, free_tcp_port: int
+) -> None:
+    """A redirect whose state does not round-trip is refused.
+
+    `state` was previously generated and sent but never compared, leaving the
+    loopback server willing to accept a stray or forged redirect.
+    """
+    result = _capture_in_thread(free_tcp_port, "GOODSTATE", timeout=20)
+    time.sleep(0.5)
+
+    _get(f"http://127.0.0.1:{free_tcp_port}/?code=X&state=FORGED")
+    result["_thread"].join(10)
+
+    assert "code" not in result
+    assert "state mismatch" in result.get("err", "")
+
+
+def test_refresh_token_times_out_with_rescue_hint(
+    _no_browser: None, free_tcp_port: int
+) -> None:
+    """An abandoned consent times out instead of blocking forever.
+
+    The message must point at --code, which rescues a consent whose redirect
+    never reached the loopback server.
+    """
+    result = _capture_in_thread(free_tcp_port, "S", timeout=2)
+    result["_thread"].join(20)
+
+    assert "code" not in result
+    assert "--code" in result.get("err", "")
+
+
+def test_refresh_token_port_in_use_is_a_clear_error(
+    _no_browser: None, free_tcp_port: int
+) -> None:
+    """Binding a taken port explains itself instead of raising a bare OSError."""
+    from dtex.sources.gads.scripts import get_refresh_token as grt
+
+    blocker = HTTPServer(("127.0.0.1", free_tcp_port), BaseHTTPRequestHandler)
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            grt._capture_code(
+                f"http://localhost:{free_tcp_port}/",
+                "http://example.invalid/consent",
+                free_tcp_port,
+                "S",
+                5,
+            )
+        assert "--port" in str(excinfo.value)
+    finally:
+        blocker.server_close()

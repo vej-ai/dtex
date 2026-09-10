@@ -10,6 +10,47 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+### Fixed
+
+- **BigQuery `merge` streams no longer orphan `__staging_*` tables.** The
+  target's schema evolution ran *between* the staging-table load and the
+  `try`/`finally` that drops it, so a failure there (a column type
+  conflict, or BigQuery's concurrent-modification / rate-limit errors on
+  table metadata — easy to hit when several streams evolve tables in one
+  dataset under `--threads N`) left a
+  `{target}__staging_{run_suffix}_{uuid}` table behind permanently. The
+  target is now evolved *before* the staging table is created, so every
+  failure path either predates the staging table or is inside the
+  `finally`. Staging tables are additionally created with a 24h
+  expiration, so BigQuery reaps the one case no `finally` can cover — the
+  process being killed mid-MERGE (SIGKILL / OOM / container eviction).
+  Orphans were harmless to correctness (the names are unique per batch, so
+  they never collide with a later run) but cluttered the dataset and cost
+  storage.
+
+## [0.12.3] — 2026-09-10
+
+### Fixed
+
+- **`gads` refresh-token helper no longer loses a completed consent.**
+  `get_refresh_token` called `handle_request()` exactly once, so the *first*
+  HTTP request of any kind closed the loopback server. Browsers routinely
+  fetch `/favicon.ico` or probe the origin before following a redirect, so
+  the genuine callback then arrived at a dead port: the user saw
+  `ERR_CONNECTION_REFUSED` after clicking *Allow*, with a valid (and
+  short-lived) authorization code stranded in the URL bar and no way to spend
+  it. Requests carrying neither `code` nor `error` are now answered `404` and
+  ignored, and the server keeps serving until the real redirect lands or the
+  new `--timeout` (default 300s) expires — it previously blocked forever on
+  an abandoned consent. Three related gaps closed at the same time: the
+  `state` parameter was generated and sent but never compared on the way back
+  (so a stray or forged redirect was accepted — it is now verified); a taken
+  port raised a bare `OSError` instead of naming `--port`; and a failed
+  `webbrowser.open()` passed silently, which is the normal case over SSH or
+  in a container. New `--code` flag exchanges an authorization code directly,
+  which rescues exactly the consent the first bug used to throw away. The
+  helper had no test coverage; it now has regression tests for each fix.
+
 ## [0.12.2] — 2026-09-09
 
 ### Fixed
@@ -1023,6 +1064,7 @@ The first public release.
   the private-disclosure channel and response timelines.
 
 [Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.2...HEAD
+[0.12.3]: https://github.com/vej-ai/dtex/releases/tag/v0.12.3
 [0.12.2]: https://github.com/vej-ai/dtex/releases/tag/v0.12.2
 [0.12.1]: https://github.com/vej-ai/dtex/releases/tag/v0.12.1
 [0.12.0]: https://github.com/vej-ai/dtex/releases/tag/v0.12.0

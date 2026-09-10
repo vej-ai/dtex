@@ -16,9 +16,12 @@ How it works (the "loopback" / installed-app OAuth flow):
   2. Open the browser to Google's consent screen, with this local server's
      ``http://localhost:<port>/`` as the redirect URI.
   3. After you click *Allow*, Google redirects back to the local server with
-     a one-time ``?code=...``; the server captures it.
-  4. Exchange that code (+ client id/secret) for a refresh token at Google's
-     token endpoint and print the refresh token.
+     a one-time ``?code=...``; the server captures it. Requests that carry
+     neither ``code`` nor ``error`` (a browser's ``/favicon.ico``, a
+     speculative probe) are answered 404 and ignored, so they cannot consume
+     the callback.
+  4. Verify the ``state`` round-trip, then exchange that code (+ client
+     id/secret) for a refresh token at Google's token endpoint.
 
 By default the refresh token is WRITTEN to a git-ignored file
 (``.secrets/gads_refresh_token``, mode 0600) and never printed — so the
@@ -55,6 +58,25 @@ Usage
     python -m dtex.sources.gads.scripts.get_refresh_token --out path/to/token
     python -m dtex.sources.gads.scripts.get_refresh_token --print
 
+    # rescue a consent whose redirect never reached the loopback server
+    # (the browser showed ERR_CONNECTION_REFUSED): copy `code=` out of that
+    # page's URL — the authorization itself succeeded — and exchange it
+    # directly. Codes are single-use and expire in ~60s.
+    python -m dtex.sources.gads.scripts.get_refresh_token --code '4/0A...'
+
+Troubleshooting
+---------------
+* **ERR_CONNECTION_REFUSED on the redirect** — the local server was no longer
+  listening. Use ``--code`` (above) to finish without re-consenting.
+* **The command exits immediately** — it must run in a real terminal that can
+  stay blocked while you consent; a wrapper that captures output and returns
+  may tear it down mid-flow.
+* **403 USER_PERMISSION_DENIED afterwards** — auth worked, but the granting
+  user has no direct access to the customer id being queried. If it is a
+  client account under a manager, set the connector's ``login_customer_id``
+  to the MCC; ``customers:listAccessibleCustomers`` shows what the user can
+  actually reach.
+
 Stdlib only — no dependency on ``requests`` or the rest of dtex, so it runs
 even in a bare interpreter.
 """
@@ -67,6 +89,7 @@ import os
 import secrets
 import stat
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -98,7 +121,7 @@ _ERROR_HTML = (
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Captures the single OAuth redirect, stashing code/error on the server."""
+    """Captures the OAuth redirect, stashing code/error on the server."""
 
     def log_message(self, *_args: object) -> None:
         return  # silence default request logging
@@ -111,34 +134,104 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             values = params.get(key)
             return values[0] if values else None
 
+        code = first("code")
+        error = first("error")
+
+        # A browser hitting a bare localhost page also asks for /favicon.ico,
+        # and some browsers speculatively probe the origin before following the
+        # redirect. Those requests carry NEITHER code nor error. Answer them 404
+        # WITHOUT recording anything, so the serve loop keeps waiting for the
+        # real callback — treating one as the callback used to close the server
+        # early, and the genuine redirect then hit a dead port
+        # (ERR_CONNECTION_REFUSED) with a valid code stranded in the URL bar.
+        if code is None and error is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+
         # Stash results on the server instance for the main thread to read.
-        self.server.oauth_code = first("code")  # type: ignore[attr-defined]
-        self.server.oauth_error = first("error")  # type: ignore[attr-defined]
+        self.server.oauth_code = code  # type: ignore[attr-defined]
+        self.server.oauth_error = error  # type: ignore[attr-defined]
         self.server.oauth_state = first("state")  # type: ignore[attr-defined]
-        ok = self.server.oauth_code is not None  # type: ignore[attr-defined]
+        self.server.oauth_done = True  # type: ignore[attr-defined]
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
-        self.wfile.write(_SUCCESS_HTML if ok else _ERROR_HTML)
+        self.wfile.write(_SUCCESS_HTML if code is not None else _ERROR_HTML)
 
 
-def _capture_code(redirect_uri: str, auth_url: str, port: int) -> str:
-    """Open the browser, wait for the single redirect, return the auth code."""
-    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+def _capture_code(
+    redirect_uri: str, auth_url: str, port: int, state: str, timeout: int
+) -> str:
+    """Open the browser, wait for the redirect, return the auth code.
+
+    Serves requests until one actually carries ``code`` or ``error`` (see the
+    handler), or ``timeout`` seconds elapse — rather than stopping after the
+    first HTTP request of any kind.
+    """
+    try:
+        server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    except OSError as exc:
+        raise SystemExit(
+            f"Cannot listen on localhost:{port} ({exc}). Another process is "
+            f"probably using it — re-run with --port <free port> (and, for a "
+            f"Web-application OAuth client, register that port's redirect URI)."
+        ) from exc
+
     server.oauth_code = None  # type: ignore[attr-defined]
     server.oauth_error = None  # type: ignore[attr-defined]
     server.oauth_state = None  # type: ignore[attr-defined]
+    server.oauth_done = False  # type: ignore[attr-defined]
+    # Bound each handle_request() so the deadline below is actually checked
+    # instead of blocking forever on a consent the user abandoned.
+    server.timeout = 1.0
 
     print(f"Opening the consent screen in your browser (redirect: {redirect_uri}) ...")
     print(f"If it doesn't open, paste this URL manually:\n\n{auth_url}\n")
-    webbrowser.open(auth_url)
+    print(
+        f"Waiting up to {timeout}s for the redirect. Leave this running until "
+        f"the browser says the authorization is complete."
+    )
+    opened = False
+    try:
+        opened = webbrowser.open(auth_url)
+    except Exception:  # pragma: no cover — platform-dependent
+        opened = False
+    if not opened:
+        print(
+            "(Could not launch a browser automatically — open the URL above "
+            "yourself. This is normal over SSH or in a container.)"
+        )
 
-    # Handle exactly one request — the OAuth redirect — then stop.
-    server.handle_request()
-    server.server_close()
+    deadline = time.monotonic() + timeout
+    try:
+        while not server.oauth_done and time.monotonic() < deadline:  # type: ignore[attr-defined]
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    if not server.oauth_done:  # type: ignore[attr-defined]
+        raise SystemExit(
+            f"Timed out after {timeout}s with no OAuth redirect.\n\n"
+            f"If the browser DID reach a 'connection refused' page, the "
+            f"authorization still succeeded — copy the `code=` value out of "
+            f"that page's URL and finish with:\n\n"
+            f"    ... get_refresh_token --code 'PASTE_CODE_HERE'\n"
+        )
 
     if server.oauth_error:  # type: ignore[attr-defined]
         raise SystemExit(f"OAuth consent returned an error: {server.oauth_error}")  # type: ignore[attr-defined]
+
+    # The state round-trip guards against a stray or forged redirect landing on
+    # the loopback server. It was previously generated and sent but never
+    # checked, which made it decorative.
+    got_state = server.oauth_state  # type: ignore[attr-defined]
+    if got_state != state:
+        raise SystemExit(
+            "OAuth state mismatch — the redirect did not come from the consent "
+            "screen this command opened. Nothing was written; re-run."
+        )
+
     code = server.oauth_code  # type: ignore[attr-defined]
     if not code:
         raise SystemExit("No authorization code received from the redirect.")
@@ -190,6 +283,22 @@ def main(argv: list[str] | None = None) -> int:
         "Default 8080.",
     )
     parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Seconds to wait for the OAuth redirect before giving up "
+        "(default: 300).",
+    )
+    parser.add_argument(
+        "--code",
+        default=None,
+        help="Skip the browser flow and exchange this authorization code "
+        "directly. Use it to rescue a consent whose redirect could not reach "
+        "the loopback server: the code is in the failed page's URL, as the "
+        "`code=` query parameter. Codes are single-use and expire in about a "
+        "minute, so re-run the consent if the exchange reports invalid_grant.",
+    )
+    parser.add_argument(
         "--out",
         default=_DEFAULT_OUT,
         help=f"File to write the refresh token to, mode 0600 "
@@ -227,7 +336,13 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
 
-    code = _capture_code(redirect_uri, auth_url, args.port)
+    if args.code:
+        print("Exchanging the authorization code supplied with --code ...")
+        code = args.code
+    else:
+        code = _capture_code(
+            redirect_uri, auth_url, args.port, state, args.timeout
+        )
     tokens = _exchange_code(
         code=code,
         client_id=args.client_id,

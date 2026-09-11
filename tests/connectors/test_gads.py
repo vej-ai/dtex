@@ -380,8 +380,37 @@ def test_flatten_row_nested_to_flat() -> None:
     assert flat["clicks"] == "5"
     assert flat["cost_micros"] == "2500000"
     assert flat["conversions"] == 1.5
-    # Missing leaf (conversions_value not in the row) → None, not KeyError.
-    assert flat["conversions_value"] is None
+    # A missing METRIC is zero, not None: protobuf JSON omits default values,
+    # so a row with no conversions carries no conversionsValue key at all.
+    # Storing NULL there leaves SUM correct but silently skews AVG.
+    assert flat["conversions_value"] == 0
+
+
+def test_flatten_row_absent_metric_is_zero_absent_dimension_is_none() -> None:
+    """Omitted metrics become 0; omitted dimensions stay None.
+
+    Google serves GoogleAdsRow as protobuf JSON, which omits any field holding
+    its default value — an ad with no video views carries no
+    videoQuartileP100Rate key, even though the API UI renders 0.0. Storing
+    NULL hid badly: SUM ignores NULLs so totals looked right while AVG dropped
+    those rows from its denominator (a real table read 0.043 as 0.217).
+
+    A missing DIMENSION is different — genuinely unknown, so NULL is honest.
+    """
+    from dtex.sources.gads.source import _FIELD_MAP, _flatten_row
+
+    row = {
+        "segments": {"date": "2026-01-01"},
+        "metrics": {"clicks": "7"},  # every other metric omitted
+    }
+    flat = _flatten_row(row, _FIELD_MAP["campaign_daily_stats"], "999")
+
+    assert flat["clicks"] == "7"
+    assert flat["cost_micros"] == 0
+    assert flat["conversions"] == 0
+    assert flat["conversions_value"] == 0
+    # campaign.name was not in the payload — a dimension, so still None.
+    assert flat["campaign_name"] is None
 
 
 def test_flatten_row_deep_nesting() -> None:

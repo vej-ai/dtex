@@ -143,10 +143,23 @@ def _flatten_row(
     doesn't carry it — it's a property of the request, not the row). Leaf
     values are passed through untouched; the engine's NORMALIZE step coerces
     them to the declared FieldType.
+
+    An absent ``metrics.*`` leaf becomes ``0``, not ``None``. Google serves
+    GoogleAdsRow as protobuf JSON, which OMITS fields holding their default
+    value — a row with no video views carries no ``videoQuartileP100Rate`` key
+    at all, even though the API's own UI renders it as ``0.0``. Storing NULL
+    there is wrong in a way that hides: ``SUM`` ignores NULLs so totals look
+    right, while ``AVG`` silently drops those rows from its denominator (a
+    real table measured 0.043 as 0.217, 5x high) and ``not_null`` tests start
+    failing downstream. Dimensions are left alone: an absent dimension really
+    is unknown, and NULL is the honest value for it.
     """
     flat: dict[str, Any] = {"customer_id": customer_id}
     for path, column in field_map.items():
-        flat[column] = _dig(row, path)
+        value = _dig(row, path)
+        if value is None and path.startswith("metrics."):
+            value = 0
+        flat[column] = value
     return flat
 
 

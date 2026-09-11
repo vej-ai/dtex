@@ -10,6 +10,27 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.12.7] — 2026-09-11
+
+### Fixed
+
+- **`gads` no longer stores NULL for a metric whose value is zero.** Google
+  serves `GoogleAdsRow` as protobuf JSON, which **omits** any field holding
+  its default value: a row with no video views carries no
+  `videoQuartileP100Rate` key at all, even though the API's own UI renders it
+  as `0.0`. The connector passed that absent leaf through as `None`, so the
+  column landed NULL instead of 0. It hid well — `SUM` ignores NULLs, so
+  totals looked correct, while `AVG` silently dropped those rows from its
+  denominator (one real table averaged 0.043 but read 0.217, 5x high) and
+  downstream `not_null` tests began failing on data that was never missing.
+  An absent `metrics.*` leaf is now `0`. Dimensions are deliberately
+  untouched: an absent dimension genuinely is unknown, and NULL is the honest
+  value there.
+
+  Integer and float metrics were already unaffected in practice, because the
+  engine's NORMALIZE step coerces a missing value of those types to 0 — the
+  bug surfaced on the rate/ratio columns that normalize to NULL.
+
 ## [0.12.6] — 2026-09-10
 
 ### Added
@@ -1138,7 +1159,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.6...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.7...HEAD
+[0.12.7]: https://github.com/vej-ai/dtex/releases/tag/v0.12.7
 [0.12.6]: https://github.com/vej-ai/dtex/releases/tag/v0.12.6
 [0.12.5]: https://github.com/vej-ai/dtex/releases/tag/v0.12.5
 [0.12.4]: https://github.com/vej-ai/dtex/releases/tag/v0.12.4

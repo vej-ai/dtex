@@ -10,6 +10,48 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-09-11
+
+### Changed
+
+- **`klaviyo` lands every payload whole, and promotes nothing by default.**
+  The first cut of the connector typed the fields *one account* happened to
+  need — `invoice_id` from `Invoice.ID`, `payment_intent` from
+  `$extra.PaymentIntent` — and dropped the rest of `event_properties` into a
+  JSON column. That is the same mistake the connector was written to fix,
+  with a different set of casualties: `event_properties` is **arbitrary per
+  account**. A Stripe integration emits `Invoice` and `$extra`, a Shopify one
+  emits `OrderId` / `SKU` / `Categories`, a custom integration emits whatever
+  that team invented. Columns fitted to one account are NULL everywhere else,
+  and the fields that matter to everyone else are invisible.
+
+  Now: only fields Klaviyo itself guarantees are typed — the event envelope,
+  the metric/profile relationships, its reserved `$event_id` and `$value`,
+  and the attribution columns. Everything else is landed whole, in three
+  JSON columns on `events` (`attributes`, `relationships`,
+  `event_properties`) and in `attributes` / `relationships` on every catalog
+  stream. Nothing an account sends can be lost, whatever it is.
+
+  Account-specific fields become a **config** decision via the new
+  `promote_properties` param — `column=json.path` pairs, empty by default:
+
+  ```yaml
+  params:
+    promote_properties: "invoice_id=Invoice.ID,payment_intent=$extra.PaymentIntent"
+  ```
+
+  Promoted columns are added to the projection automatically, so no schema
+  override is needed.
+
+  Landing the full `attributes` object has a second payoff: an
+  Airbyte-shaped `JSON_VALUE(attributes, '$.event_properties."$campaign"')`
+  extraction keeps working after a source repoint, so migrating a dbt project
+  off `source-klaviyo` stops being a model rewrite.
+
+  **Breaking:** `events.invoice_id` and `events.payment_intent` are gone as
+  built-in columns. Restore them for a Stripe-backed account with the
+  `promote_properties` line above.
+
 ## [0.13.0] — 2026-09-11
 
 ### Added

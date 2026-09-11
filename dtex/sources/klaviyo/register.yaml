@@ -37,14 +37,21 @@
 #
 # Streams:
 #
-# * `events` — the fact table. One row per Klaviyo event, with
-#   `event_properties` kept whole as JSON plus the fields worth having as
-#   columns: the Stripe join keys (`event_id` = the `ch_`/`py_` charge id,
-#   `invoice_id`, `payment_intent`), `value`, and the six attribution
-#   columns. `attributed_channel` is derived: 'flow' when a flow relationship
-#   is present, 'campaign' when a campaign one is, else NULL. Filterable to
-#   a subset of metrics via `metric_ids` — a full-history pull of every
-#   metric is tens of millions of rows.
+# * `events` — the fact table. One row per Klaviyo event. Every payload is
+#   landed WHOLE (`attributes`, `relationships`, `event_properties` as JSON);
+#   the typed columns are only the fields Klaviyo guarantees for every
+#   account — the event envelope, the metric/profile relationships, its
+#   reserved `$event_id` / `$value`, and the six attribution columns.
+#   `attributed_channel` is derived: 'flow' when a flow relationship is
+#   present, 'campaign' when a campaign one is, else NULL.
+#
+#   Integration-specific properties are NOT typed by default, because
+#   `event_properties` is arbitrary per account: a Stripe integration emits
+#   Invoice/$extra.PaymentIntent, Shopify emits OrderId/SKU/Categories, a
+#   custom integration emits whatever that team invented. Lift the ones you
+#   query often into columns with `promote_properties`; nothing is ever lost
+#   either way. Filterable to a subset of metrics via `metric_ids` — a
+#   full-history pull of every metric is tens of millions of rows.
 #
 # * `metrics`, `flows`, `campaigns`, `lists` — the catalogs, `replace` each
 #   run (tens to hundreds of rows). `campaigns` pulls email and SMS
@@ -126,6 +133,21 @@ params:
       NULL, which is exactly why a profile table can look complete while
       being unable to answer "may we email this person?". Set to "" to skip
       both and pay less per page.
+  promote_properties:
+    type: string
+    default: ""
+    description: >-
+      Comma-separated `event_properties` paths to lift into their own
+      columns on the `events` stream, as `column_name=json.path` pairs
+      (e.g. "charge_id=$event_id,invoice_id=Invoice.ID,value=$value").
+      EMPTY BY DEFAULT and deliberately so: `event_properties` is arbitrary
+      per account — a Stripe integration emits $event_id/Invoice, a Shopify
+      one emits OrderId/SKU, a custom integration emits whatever that team
+      invented — so no built-in list can be right for everyone. Nothing is
+      ever lost by leaving this empty: the whole payload is always landed in
+      `event_properties`, and promotions are a query-convenience layer on
+      top. Declare the matching columns in a `schema` override, or read them
+      back out of the JSON.
   event_include_profile:
     type: bool
     default: true
@@ -222,11 +244,14 @@ streams:
       - {name: profile_id,     type: STRING,    description: "The Klaviyo profile — join the `profiles` stream for the full record."}
       - {name: profile_email,       type: STRING, description: "The profile's email, carried inline via include=profile. Lets an event join to a customer table without the profiles stream being complete."}
       - {name: profile_external_id, type: STRING, description: "The profile's external_id — your own user id — carried inline. The identity join key."}
-      - {name: event_id,       type: STRING,    description: "event_properties.$event_id — for Stripe-sourced metrics this is the CHARGE id (ch_... or legacy py_...), the join key to a transactions table."}
-      - {name: invoice_id,     type: STRING,    description: "event_properties.Invoice.ID (in_...) when the event carries an invoice."}
-      - {name: payment_intent, type: STRING,    description: "event_properties.$extra.PaymentIntent (pi_...) when present."}
-      - {name: value,          type: FLOAT,     description: "event_properties.$value — for Stripe charges, the invoice total AFTER discount. Gross of refunds: refunds are a separate metric."}
-      - {name: value_currency, type: STRING}
+      # $event_id and $value are Klaviyo's OWN reserved properties (the
+      # idempotency key and the numeric value behind conversion statistics),
+      # so they are universal and safe to type. Everything below them is
+      # integration-specific and lives in `event_properties` unless a config
+      # promotes it — see the `promote_properties` param.
+      - {name: event_id,       type: STRING,    description: "event_properties.$event_id — Klaviyo's reserved unique id for the event. For a Stripe-sourced metric this is the CHARGE id (ch_... or legacy py_...); for Shopify it is the order id. Whatever the integration keys on."}
+      - {name: value,          type: FLOAT,     description: "event_properties.$value — Klaviyo's reserved numeric value, the basis of every conversion_value statistic. For a Stripe charge, the invoice total AFTER discount, gross of refunds."}
+      - {name: value_currency, type: STRING,    description: "event_properties.$value_currency, falling back to Currency."}
       - {name: attribution_id,                type: STRING, description: "The attribution object's id. Present whenever Klaviyo credited this event to a message."}
       - {name: attributed_channel,            type: STRING, description: "Derived: 'flow' | 'campaign' | NULL. Which relationship the attribution carried."}
       - {name: attributed_flow_id,            type: STRING, description: "Flow credited with the conversion — join the `flows` stream."}
@@ -234,7 +259,9 @@ streams:
       - {name: attributed_campaign_id,        type: STRING, description: "Campaign credited with the conversion — join the `campaigns` stream."}
       - {name: attributed_campaign_message_id, type: STRING, description: "The specific campaign message / A-B variation — join the `campaign_messages` stream."}
       - {name: attributed_event_id,           type: STRING, description: "The triggering engagement event (the open/click Klaviyo attributed to), as an event id."}
-      - {name: event_properties, type: JSON,   description: "The whole event_properties payload, unmodified — everything not promoted to a column above."}
+      - {name: event_properties, type: JSON,   description: "The whole event_properties payload, unmodified. Account-specific by nature: Stripe integrations put Invoice/$extra.PaymentIntent here, Shopify puts OrderId/SKU/Categories, custom integrations put anything. Promote what you query often via `promote_properties`; nothing is ever dropped."}
+      - {name: attributes,       type: JSON,   description: "The event's ENTIRE `attributes` object exactly as Klaviyo returned it, including event_properties. Full fidelity on purpose — a connector cannot know which fields a given account's integrations emit, so nothing is filtered. This is also what makes an Airbyte-shaped `JSON_VALUE(attributes, ...)` extraction keep working after a repoint."}
+      - {name: relationships,    type: JSON,   description: "The event's entire `relationships` object, unmodified — metric, profile and the attributions linkage the typed columns above are derived from."}
 
   # ---------------------------------------------------------------------
   # catalogs — small, replaced every run
@@ -252,6 +279,8 @@ streams:
       - {name: integration_name,  type: STRING, description: "Which integration emits it — 'Stripe', 'API', 'Klaviyo', 'Shopify'. Distinguishes native-integration metrics from ones we send."}
       - {name: integration_category, type: STRING}
       - {name: integration_object,   type: STRING}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
 
   - name: flows
     table: flows
@@ -265,6 +294,8 @@ streams:
       - {name: trigger_type, type: STRING}
       - {name: created,      type: TIMESTAMP}
       - {name: updated,      type: TIMESTAMP}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
 
   - name: campaigns
     table: campaigns
@@ -284,6 +315,8 @@ streams:
       - {name: send_options,     type: JSON}
       - {name: send_strategy,    type: JSON}
       - {name: tracking_options, type: JSON, description: "Carries add_utm / utm_params — a flow or campaign with add_utm false produces clicks with NO UTMs, which is why some Klaviyo-attributed revenue can never appear in a UTM-based channel model."}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
 
   - name: campaign_messages
     table: campaign_messages
@@ -300,6 +333,8 @@ streams:
       - {name: from_label,   type: STRING}
       - {name: send_times,   type: JSON}
       - {name: definition,   type: JSON, description: "The whole message definition, unmodified."}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
 
   - name: flow_messages
     table: flow_messages
@@ -320,6 +355,8 @@ streams:
       - {name: add_tracking_params,   type: BOOLEAN, description: "FALSE means this message's links carry NO UTMs, so revenue Klaviyo attributes to it can never appear in a UTM-based channel model. The dunning flow's messages are the common case."}
       - {name: created,        type: TIMESTAMP}
       - {name: updated,        type: TIMESTAMP}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
       - {name: definition,     type: JSON, description: "The whole message definition, unmodified."}
 
   - name: lists
@@ -400,6 +437,8 @@ streams:
       - {name: created,       type: TIMESTAMP}
       - {name: updated,       type: TIMESTAMP}
       - {name: definition,    type: JSON, description: "The audience logic itself — condition groups, the metrics and filters that define membership."}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
 
   - name: list_memberships
     table: list_memberships
@@ -438,6 +477,8 @@ streams:
       - {name: text,        type: STRING}
       - {name: created,     type: TIMESTAMP}
       - {name: updated,     type: TIMESTAMP}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
 
   - name: tags
     table: tags
@@ -462,6 +503,8 @@ streams:
       - {name: ab_test,    type: BOOLEAN}
       - {name: created_at, type: TIMESTAMP}
       - {name: updated_at, type: TIMESTAMP}
+      - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
+      - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
 
   - name: account
     table: account

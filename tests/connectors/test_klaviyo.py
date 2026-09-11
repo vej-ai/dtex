@@ -23,6 +23,7 @@ from dtex.sources.klaviyo.source import (
     _emit_stream,
     _event_record,
     _page_size,
+    _parse_promotions,
     _predictive_columns,
     _profile_index,
     _rel_ids,
@@ -147,13 +148,61 @@ def test_attribution_paginated_out_keeps_the_id() -> None:
     assert record["attributed_channel"] is None
 
 
-def test_stripe_join_keys_are_promoted(page: dict[str, Any]) -> None:
+def test_only_klaviyo_reserved_properties_are_typed(page: dict[str, Any]) -> None:
+    """`$event_id` and `$value` are Klaviyo's own reserved keys — universal.
+
+    Integration-specific properties (Invoice.ID, $extra.PaymentIntent) are
+    NOT columns: they exist on a Stripe-backed account and nowhere else.
+    """
     record = _event_record(page["data"][0], _attribution_index(page))
     assert record["event_id"] == "ch_3U3zc9KECY1q7gSO0otFKAP3"
-    assert record["invoice_id"] == "in_1U3yfnKECY1q7gSOW3UQyMpf"
-    assert record["payment_intent"] == "pi_3U3zc9KECY1q7gSO0TfiqD1Z"
     assert record["value"] == 70.8
     assert record["value_currency"] == "usd"
+    assert "invoice_id" not in record
+    assert "payment_intent" not in record
+
+
+def test_full_payloads_are_landed_whole(page: dict[str, Any]) -> None:
+    """Nothing an account sends may be dropped, whatever its integration emits.
+
+    `attributes` is the whole object as Klaviyo returned it, which is also
+    what lets an Airbyte-shaped JSON_VALUE(attributes, ...) extraction keep
+    working after a source repoint.
+    """
+    record = _event_record(page["data"][0], _attribution_index(page))
+    assert record["attributes"] == page["data"][0]["attributes"]
+    assert record["relationships"] == page["data"][0]["relationships"]
+    assert record["event_properties"] == page["data"][0]["attributes"]["event_properties"]
+    # The integration-specific fields survive inside the raw payloads.
+    assert record["event_properties"]["Invoice"]["ID"] == "in_1U3yfnKECY1q7gSOW3UQyMpf"
+
+
+def test_promote_properties_parsing() -> None:
+    assert _parse_promotions("invoice_id=Invoice.ID") == [("invoice_id", ("Invoice", "ID"))]
+    assert _parse_promotions("pi=$extra.PaymentIntent") == [("pi", ("$extra", "PaymentIntent"))]
+    # A bare path promotes under its own last segment.
+    assert _parse_promotions("OrderId") == [("OrderId", ("OrderId",))]
+    assert _parse_promotions("a=B.C, d=E") == [("a", ("B", "C")), ("d", ("E",))]
+    assert _parse_promotions("") == []
+    assert _parse_promotions(None) == []
+
+
+def test_promotions_lift_account_specific_properties(page: dict[str, Any]) -> None:
+    """What one account needs as a column, another has never heard of."""
+    promotions = _parse_promotions(
+        "invoice_id=Invoice.ID,payment_intent=$extra.PaymentIntent,total=Invoice.Total"
+    )
+    record = _event_record(page["data"][0], _attribution_index(page), None, promotions)
+    assert record["invoice_id"] == "in_1U3yfnKECY1q7gSOW3UQyMpf"
+    assert record["payment_intent"] == "pi_3U3zc9KECY1q7gSO0TfiqD1Z"
+    assert record["total"] == 70.8
+
+    # A path this account's integration does not emit is NULL, not an error —
+    # the same config must be safe to point at a different Klaviyo account.
+    shopify = _parse_promotions("order_id=OrderId,sku=SKU")
+    record = _event_record(page["data"][0], _attribution_index(page), None, shopify)
+    assert record["order_id"] is None
+    assert record["sku"] is None
 
 
 # --------------------------------------------------------------------------

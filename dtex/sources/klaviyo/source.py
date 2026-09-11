@@ -130,6 +130,28 @@ def _nested(payload: Mapping[str, Any], *path: str) -> Any:
     return node
 
 
+def _parse_promotions(raw: Any) -> list[tuple[str, tuple[str, ...]]]:
+    """Parse ``promote_properties`` into ``(column, path)`` pairs.
+
+    Format is ``column=json.path`` entries, comma separated::
+
+        charge_id=$event_id,invoice_id=Invoice.ID,pi=$extra.PaymentIntent
+
+    Dots separate levels; a leading ``$`` is part of Klaviyo's own key name
+    (``$event_id``), not syntax. An entry without ``=`` promotes the path's
+    last segment under its own name.
+    """
+    promotions: list[tuple[str, tuple[str, ...]]] = []
+    for entry in _csv(raw):
+        column, _, path = entry.partition("=")
+        if not path:
+            path, column = column, column.split(".")[-1]
+        segments = tuple(part for part in path.split(".") if part)
+        if column and segments:
+            promotions.append((column, segments))
+    return promotions
+
+
 def _rel_ids(relationships: Mapping[str, Any], key: str) -> list[str]:
     """Every ``relationships[key].data[].id`` — the to-many counterpart of _rel_id."""
     rel = relationships.get(key)
@@ -298,8 +320,15 @@ def _event_record(
     event: Mapping[str, Any],
     attributions: Mapping[str, dict[str, Any]],
     profiles_by_id: Mapping[str, dict[str, Any]] | None = None,
+    promotions: Sequence[tuple[str, tuple[str, ...]]] | None = None,
 ) -> dict[str, Any]:
-    """One event row: promoted scalars, the attribution fold, properties as JSON."""
+    """One event row: universal scalars, the attribution fold, raw payloads.
+
+    Only fields Klaviyo guarantees for every account are typed. Anything an
+    integration happens to emit stays in ``event_properties`` (and in the
+    full ``attributes`` copy) unless ``promotions`` — from the config's
+    ``promote_properties`` — lifts it into a column.
+    """
     attrs = event.get("attributes") or {}
     props = attrs.get("event_properties") or {}
     rels = event.get("relationships") or {}
@@ -329,7 +358,6 @@ def _event_record(
                     attribution["attribution_id"] = str(entry["id"])
                     break
 
-    value = props.get("$value")
     record: dict[str, Any] = {
         "id": str(event.get("id")),
         "datetime": attrs.get("datetime"),
@@ -337,15 +365,24 @@ def _event_record(
         "uuid": attrs.get("uuid"),
         "metric_id": _rel_id(rels, "metric") if isinstance(rels, Mapping) else None,
         "profile_id": _rel_id(rels, "profile") if isinstance(rels, Mapping) else None,
+        # Klaviyo's OWN reserved properties — universal across accounts.
         "event_id": props.get("$event_id"),
-        "invoice_id": _nested(props, "Invoice", "ID"),
-        "payment_intent": _nested(props, "$extra", "PaymentIntent"),
-        "value": value,
+        "value": props.get("$value"),
         "value_currency": props.get("$value_currency") or props.get("Currency"),
+        # Full fidelity. `attributes` carries event_properties too; both are
+        # kept so an Airbyte-shaped JSON_VALUE(attributes, ...) extraction
+        # survives a repoint unchanged.
         "event_properties": props,
+        "attributes": attrs,
+        "relationships": rels,
         "profile_email": None,
         "profile_external_id": None,
     }
+    # Account-specific fields the CONFIG asked for. Nothing is promoted by
+    # default: event_properties is arbitrary per integration, so a built-in
+    # list would be right for one account and wrong for the rest.
+    for column, path in promotions or ():
+        record[column] = _nested(props, *path)
     profile_id = record["profile_id"]
     if profiles_by_id and profile_id:
         record.update(profiles_by_id.get(str(profile_id)) or {})
@@ -371,11 +408,18 @@ def events(
     observed values fall as the walk goes, so only a completed stream may
     advance the cursor.
     """
-    columns = _declared_columns(stream_def)
     batch_size = max(1, int(config.get("batch_size") or 2000))
     page_size = max(1, min(int(config.get("page_size") or 200), 1000))
     metric_ids = _csv(config.get("metric_ids"))
     start = cursor.start_value()
+
+    # Promoted columns are not in register.yaml — they are whatever THIS
+    # account's config asked for — so they must be added to the projection
+    # explicitly. Without this _project drops every one of them and the
+    # feature silently does nothing.
+    promotions = _parse_promotions(config.get("promote_properties"))
+    declared = _declared_columns(stream_def)
+    columns = declared + [c for c, _ in promotions if c not in declared]
 
     # ONE upper bound, fixed before the first request, shared by every metric
     # pass. Without it a long multi-metric run commits the newest datetime any
@@ -404,6 +448,11 @@ def events(
     batch: list[dict[str, Any]] = []
     # An empty `metric_ids` means "every metric": one unfiltered pass.
     scopes: list[str | None] = list(metric_ids) if metric_ids else [None]
+    if promotions:
+        log.info(
+            "klaviyo.events: promoting %d event property path(s): %s",
+            len(promotions), ", ".join(c for c, _ in promotions),
+        )
     with _build_client(config, log) as client:
         for metric_id in scopes:
             scoped = list(filters)
@@ -429,7 +478,9 @@ def events(
                 for event in body.get("data") or []:
                     if not isinstance(event, dict):
                         continue
-                    record = _event_record(event, attributions, profiles_by_id)
+                    record = _event_record(
+                        event, attributions, profiles_by_id, promotions
+                    )
                     cursor.observe(record["datetime"])
                     if record.get("attribution_id"):
                         attributed += 1
@@ -540,6 +591,8 @@ def metrics(stream_def: StreamDef, config: Config, log: logging.Logger) -> Itera
                         "integration_name": integration.get("name"),
                         "integration_category": integration.get("category"),
                         "integration_object": integration.get("object"),
+                        "attributes": attrs,
+                        "relationships": item.get("relationships") or {},
                     }
                 )
     log.info("klaviyo.metrics: %d metric(s)", len(out))
@@ -565,6 +618,8 @@ def flows(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iterato
                         "trigger_type": attrs.get("trigger_type"),
                         "created": attrs.get("created"),
                         "updated": attrs.get("updated"),
+                        "attributes": attrs,
+                        "relationships": item.get("relationships") or {},
                     }
                 )
     log.info("klaviyo.flows: %d flow(s)", len(out))
@@ -778,6 +833,8 @@ def lists(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iterato
                         "opt_in_process": attrs.get("opt_in_process"),
                         "created": attrs.get("created"),
                         "updated": attrs.get("updated"),
+                        "attributes": attrs,
+                        "relationships": item.get("relationships") or {},
                     }
                 )
     log.info("klaviyo.lists: %d list(s)", len(out))
@@ -809,6 +866,8 @@ def segments(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iter
                         "created": attrs.get("created"),
                         "updated": attrs.get("updated"),
                         "definition": attrs.get("definition"),
+                        "attributes": attrs,
+                        "relationships": item.get("relationships") or {},
                     }
                 )
     log.info("klaviyo.segments: %d segment(s)", len(out))
@@ -925,6 +984,8 @@ def templates(stream_def: StreamDef, config: Config, log: logging.Logger) -> Ite
                         "text": attrs.get("text"),
                         "created": attrs.get("created"),
                         "updated": attrs.get("updated"),
+                        "attributes": attrs,
+                        "relationships": item.get("relationships") or {},
                     }
                 )
     log.info("klaviyo.templates: %d template(s)", len(out))
@@ -995,6 +1056,8 @@ def forms(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iterato
                         "ab_test": attrs.get("ab_test"),
                         "created_at": attrs.get("created_at"),
                         "updated_at": attrs.get("updated_at"),
+                        "attributes": attrs,
+                        "relationships": item.get("relationships") or {},
                     }
                 )
     log.info("klaviyo.forms: %d form(s)", len(out))

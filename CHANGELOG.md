@@ -10,6 +10,63 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-09-11
+
+### Added
+
+- **A `klaviyo` source connector** — 18 streams over Klaviyo's JSON:API. It
+  exists for three things that are genuinely hard to get out of Klaviyo, each
+  of which fails *silently*: the table looks complete and the columns are
+  simply empty.
+
+  **Attribution.** Klaviyo decides which flow, campaign and message it credits
+  a conversion to, and that verdict is not on the event. Revision
+  `2024-02-15` removed `$attribution` from `event_properties` and moved it to
+  an `?include=attributions` sidecar. Airbyte's connector sends the include
+  but never joins the `included` block back onto the event
+  (airbytehq/airbyte#54174), so the warehouse gets an opaque attribution id
+  and nothing else — every "which email drove this revenue?" question has to
+  be asked in Klaviyo's UI instead of next to your own revenue data. This
+  connector parses `included` and folds the ids onto the event row:
+  `attributed_flow_id`, `attributed_flow_message_id`,
+  `attributed_campaign_id`, `attributed_campaign_message_id`,
+  `attributed_event_id`, plus a derived `attributed_channel`. Deeper includes
+  (`attributions.flow`) are rejected by the API with a 400 and
+  `fields[attribution]` accepts only `id`, so ids are as far as one request
+  reaches; the catalog streams supply the names.
+
+  **Late attribution.** Klaviyo events are immutable and carry no
+  `updated_at` — `datetime` is when the event happened, and attribution is
+  written up to ~3 hours later (airbytehq/airbyte#61001). A plain cursor on
+  `datetime` therefore extracts most conversions *before* their attribution
+  exists and never revisits them. The `events` stream declares `lookback: 3d`,
+  `write_disposition: merge` on the event id, and `ordered: false` — three
+  declarations that only work together: the re-walk re-fetches, the merge
+  overwrites the NULL in place, and the unordered flag stops a mid-run state
+  flush from advancing the cursor past events whose attribution has not
+  landed yet.
+
+  **Consent.** `subscriptions` is not in a default `/profiles` response.
+  Without `additional-fields[profile]=subscriptions` every consent column is
+  NULL and the profile table cannot say whether anyone is contactable. The
+  connector requests it and flattens the answer — including the suppression
+  list, because a profile can read `SUBSCRIBED` and still be unreachable
+  after a hard bounce. Klaviyo's predictive analytics ride the same field.
+
+  Also landed: the Reporting API (`campaign_reports`, `flow_reports`,
+  `segment_reports`), which is the only surface that reproduces Klaviyo's own
+  UI numbers — the app buckets by *send date* while the event stream buckets
+  by *event time*, which is why an event-derived open rate never matches the
+  dashboard being quoted at you. Plus segments and their definitions, list and
+  segment membership (with `external_id`, for direct customer joins), tags,
+  forms, templates, and the account's timezone and currency.
+
+  Events carry `profile_email` / `profile_external_id` inline via
+  `include=profile`, so an event-to-customer join does not depend on the
+  `profiles` stream having caught up. Campaign catalogs walk archived
+  campaigns in a second pass — Klaviyo hides them by default, and an
+  attributed event can reference a campaign archived years earlier.
+
 ## [0.12.7] — 2026-09-11
 
 ### Fixed

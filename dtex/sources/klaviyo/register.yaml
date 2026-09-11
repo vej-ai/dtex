@@ -1,0 +1,525 @@
+# Klaviyo — baked source connector for the JSON:API REST API.
+#
+# Built for one thing Airbyte's source-klaviyo cannot do: land each event's
+# ATTRIBUTION — which flow, campaign and message Klaviyo credits a conversion
+# to — on the event row itself.
+#
+# Why that matters. Klaviyo removed `$attribution` from `event_properties` in
+# revision 2024-02-15; it now arrives only as an `?include=attributions`
+# sidecar. Airbyte's connector sends the include but never joined the
+# `included` block back onto the event (airbytehq/airbyte#54174), so the
+# warehouse gets a bare relationship stub — an opaque attribution id with no
+# flow, campaign or message. Every "which email drove this revenue?" question
+# then has to be asked in Klaviyo's UI instead of the warehouse. This
+# connector parses `included` and folds the ids onto the event.
+#
+# The second defect it fixes is late attribution. Klaviyo events are
+# IMMUTABLE and carry no `updated_at`: `datetime` is when the event happened,
+# and attribution is written up to ~3 hours later (airbytehq/airbyte#61001).
+# A cursor on `datetime` therefore extracts most conversions BEFORE their
+# attribution exists and, being immutable, never revisits them — the
+# attribution is lost permanently. The fix is structural and has three parts,
+# all of which must hold together:
+#
+#   1. `lookback: 3d` — every run re-walks the trailing window, so an event
+#      first seen unattributed is re-fetched once its attribution lands.
+#   2. `write_disposition: merge` on the event id — the re-fetch UPDATES the
+#      existing row rather than duplicating it, so a NULL attribution is
+#      overwritten in place.
+#   3. `ordered: false` — the walk is newest-first (`sort=-datetime`) and
+#      re-visits old values, so a mid-run state flush must NOT advance the
+#      cursor to the observed maximum. With `ordered: true` a crash partway
+#      would commit the newest datetime seen and skip every older event in
+#      the window whose attribution had not yet been written.
+#
+# Widen `lookback` if Klaviyo's attribution delay grows; the merge makes the
+# re-walk idempotent, so the only cost is API calls.
+#
+# Streams:
+#
+# * `events` — the fact table. One row per Klaviyo event, with
+#   `event_properties` kept whole as JSON plus the fields worth having as
+#   columns: the Stripe join keys (`event_id` = the `ch_`/`py_` charge id,
+#   `invoice_id`, `payment_intent`), `value`, and the six attribution
+#   columns. `attributed_channel` is derived: 'flow' when a flow relationship
+#   is present, 'campaign' when a campaign one is, else NULL. Filterable to
+#   a subset of metrics via `metric_ids` — a full-history pull of every
+#   metric is tens of millions of rows.
+#
+# * `metrics`, `flows`, `campaigns`, `lists` — the catalogs, `replace` each
+#   run (tens to hundreds of rows). `campaigns` pulls email and SMS
+#   separately because Klaviyo REQUIRES a channel filter on that endpoint.
+#
+# * `campaign_messages` — the per-message catalog, from
+#   `campaigns?include=campaign-messages`, so an attributed
+#   `campaign_message_id` resolves to a label and subject line without a
+#   per-message request (there is no GET /campaign-messages list endpoint).
+#
+# * `flow_messages` — the flow equivalent, and the one expensive stream: it
+#   costs one GET per flow action, so it is OFF unless a config selects it.
+#   Flows expose `flow-actions`, not messages, so the walk is
+#   flow -> actions -> messages.
+#
+# * `profiles` — the profile catalog, incremental on `updated`. Carries
+#   `external_id`, which is how a Klaviyo profile joins to an app user.
+#
+# Auth: a private API key (`pk_...`) with read scope on events, metrics,
+# flows, campaigns, lists and profiles. Klaviyo pins behavior to a dated
+# `revision` header; `api_revision` sets it, so a Klaviyo-side change can
+# never silently alter the response shape mid-pipeline.
+#
+# Rate limits: Klaviyo publishes burst/steady limits per endpoint and returns
+# them in `RateLimit-Limit` (e.g. "350, 350;w=1, 3500;w=60"). The client
+# honours `Retry-After` on a 429 and a token bucket keeps steady traffic
+# under `requests_per_second`.
+
+name: klaviyo
+kind: source
+version: "1.0.0"
+summary: Klaviyo JSON:API — events with resolved flow/campaign attribution, plus metric, flow, campaign, message, list and profile catalogs.
+tags: [klaviyo, saas, email, sms, marketing, attribution, rest]
+
+requires:
+  - "requests>=2.31"
+
+params:
+  base_url:
+    type: string
+    default: "https://a.klaviyo.com/api"
+    description: API base URL — overridable for stubbed tests.
+  api_revision:
+    type: string
+    default: "2026-07-15"
+    description: Value of the `revision` header. Klaviyo pins response shape to this date; bump deliberately, never implicitly.
+  page_size:
+    type: int
+    default: 200
+    description: Records per page on the events endpoint (Klaviyo's max is 1000; 200 keeps a page's `included` block manageable).
+  catalog_page_size:
+    type: int
+    default: 50
+    description: >-
+      Requested records per page on the catalog endpoints. Klaviyo's real
+      ceiling differs PER endpoint and exceeding it is a hard 400, not a
+      clamp — lists/segments/templates cap at 10, flows/tags at 50,
+      campaigns/forms at 100, and /metrics rejects the parameter entirely.
+      The connector clamps this value down to whatever each endpoint allows,
+      so setting it high is safe.
+  metric_ids:
+    type: string
+    default: ""
+    description: >-
+      Comma-separated metric ids the `events` stream extracts (e.g. the
+      Stripe "Successfully Paid" metric). Empty = every metric, which for a
+      mature account is tens of millions of rows — set this unless you
+      genuinely want the whole event firehose.
+  profiles_page_size:
+    type: int
+    default: 100
+    description: Records per page on /profiles (Klaviyo's max is 100).
+  profile_additional_fields:
+    type: string
+    default: "subscriptions,predictive_analytics"
+    description: >-
+      Passed as `additional-fields[profile]`. Consent state (`subscriptions`)
+      is NOT returned by default — omit it and every consent column lands
+      NULL, which is exactly why a profile table can look complete while
+      being unable to answer "may we email this person?". Set to "" to skip
+      both and pay less per page.
+  event_include_profile:
+    type: bool
+    default: true
+    description: >-
+      Add `include=profile` to the events walk so each event row carries the
+      profile's email and external_id inline. Makes event->customer joins
+      independent of the profiles stream being complete and current.
+  conversion_metric_id:
+    type: string
+    default: ""
+    description: >-
+      The metric the Reporting streams compute conversion statistics against
+      (e.g. a "Placed Order" / "Successfully Paid" metric id). REQUIRED by
+      the campaign/flow reporting endpoints; those streams no-op with a
+      warning when it is unset.
+  report_timeframe_key:
+    type: string
+    default: "last_12_months"
+    description: >-
+      Predefined timeframe for the reporting streams — today, yesterday,
+      this_week, last_7_days, last_week, this_month, last_30_days,
+      last_month, last_90_days, last_3_months, last_365_days,
+      last_12_months, this_year, last_year. Max span is 1 year.
+  report_statistics:
+    type: string
+    default: "opens,opens_unique,clicks,clicks_unique,recipients,delivered,bounced,conversions,conversion_value,conversion_uniques,revenue_per_recipient,average_order_value,open_rate,click_rate,click_to_open_rate,bounce_rate,delivery_rate,unsubscribe_rate,unsubscribes,spam_complaints,spam_complaint_rate"
+    description: Comma-separated statistics for the campaign/flow reporting streams.
+  membership_max_lists:
+    type: int
+    default: 0
+    description: list_memberships only — stop after this many lists (0 = unlimited).
+  membership_max_segments:
+    type: int
+    default: 0
+    description: segment_memberships only — stop after this many segments (0 = unlimited).
+  campaign_channels:
+    type: string
+    default: "email,sms"
+    description: Channels the `campaigns` / `campaign_messages` streams walk. Klaviyo requires a channel filter on /campaigns, so each is a separate pass.
+  max_flows_per_run:
+    type: int
+    default: 0
+    description: flow_messages only — stop after this many flows (0 = unlimited). Turns a first run into resumable chunks.
+  batch_size:
+    type: int
+    default: 2000
+    description: Rows per yielded batch (= one destination load).
+  requests_per_second:
+    type: float
+    default: 8.0
+    description: Client-side token-bucket ceiling. Klaviyo's steady limit is far higher; this keeps a backfill polite.
+  max_retries:
+    type: int
+    default: 5
+    description: Retries for 429 / 5xx / connection errors before giving up.
+  retry_backoff_seconds:
+    type: float
+    default: 1.0
+    description: Base seconds for exponential backoff on 5xx (1, 2, 4, ...).
+  rate_limit_max_wait_seconds:
+    type: float
+    default: 60.0
+    description: Longest single wait honoured from Retry-After on a 429.
+  timeout_seconds:
+    type: float
+    default: 60.0
+    description: Per-request HTTP timeout.
+
+secrets:
+  - name: api_key
+    ref: ${env.KLAVIYO_API_KEY}
+
+streams:
+  # ---------------------------------------------------------------------
+  # events — the fact table, with attribution folded on
+  # ---------------------------------------------------------------------
+  - name: events
+    table: events
+    primary_key: id
+    write_disposition: merge
+    partition_by: datetime
+    incremental:
+      cursor_field: datetime
+      cursor_type: timestamp
+      lookback: 3d          # Klaviyo writes attribution up to ~3h after the event; 3d is generous headroom
+      initial_value: "2024-01-01T00:00:00Z"
+      ordered: false        # newest-first walk revisits old values — see the header note
+    schema:
+      - {name: id,             type: STRING,    mode: REQUIRED, description: "Klaviyo event id. Primary key."}
+      - {name: datetime,       type: TIMESTAMP, mode: REQUIRED, description: "When the event OCCURRED. Not when attribution was written — see the connector header."}
+      - {name: timestamp,      type: INTEGER,   description: "Unix-second form of `datetime`."}
+      - {name: uuid,           type: STRING}
+      - {name: metric_id,      type: STRING,    description: "The metric (event type) — join the `metrics` stream for its name."}
+      - {name: profile_id,     type: STRING,    description: "The Klaviyo profile — join the `profiles` stream for the full record."}
+      - {name: profile_email,       type: STRING, description: "The profile's email, carried inline via include=profile. Lets an event join to a customer table without the profiles stream being complete."}
+      - {name: profile_external_id, type: STRING, description: "The profile's external_id — your own user id — carried inline. The identity join key."}
+      - {name: event_id,       type: STRING,    description: "event_properties.$event_id — for Stripe-sourced metrics this is the CHARGE id (ch_... or legacy py_...), the join key to a transactions table."}
+      - {name: invoice_id,     type: STRING,    description: "event_properties.Invoice.ID (in_...) when the event carries an invoice."}
+      - {name: payment_intent, type: STRING,    description: "event_properties.$extra.PaymentIntent (pi_...) when present."}
+      - {name: value,          type: FLOAT,     description: "event_properties.$value — for Stripe charges, the invoice total AFTER discount. Gross of refunds: refunds are a separate metric."}
+      - {name: value_currency, type: STRING}
+      - {name: attribution_id,                type: STRING, description: "The attribution object's id. Present whenever Klaviyo credited this event to a message."}
+      - {name: attributed_channel,            type: STRING, description: "Derived: 'flow' | 'campaign' | NULL. Which relationship the attribution carried."}
+      - {name: attributed_flow_id,            type: STRING, description: "Flow credited with the conversion — join the `flows` stream."}
+      - {name: attributed_flow_message_id,    type: STRING, description: "The specific flow message — join the `flow_messages` stream (opt-in)."}
+      - {name: attributed_campaign_id,        type: STRING, description: "Campaign credited with the conversion — join the `campaigns` stream."}
+      - {name: attributed_campaign_message_id, type: STRING, description: "The specific campaign message / A-B variation — join the `campaign_messages` stream."}
+      - {name: attributed_event_id,           type: STRING, description: "The triggering engagement event (the open/click Klaviyo attributed to), as an event id."}
+      - {name: event_properties, type: JSON,   description: "The whole event_properties payload, unmodified — everything not promoted to a column above."}
+
+  # ---------------------------------------------------------------------
+  # catalogs — small, replaced every run
+  # ---------------------------------------------------------------------
+  - name: metrics
+    table: metrics
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,                type: STRING, mode: REQUIRED}
+      - {name: name,              type: STRING, description: "Display name, e.g. 'Successfully Paid'."}
+      - {name: created,           type: TIMESTAMP}
+      - {name: updated,           type: TIMESTAMP}
+      - {name: integration_id,    type: STRING}
+      - {name: integration_name,  type: STRING, description: "Which integration emits it — 'Stripe', 'API', 'Klaviyo', 'Shopify'. Distinguishes native-integration metrics from ones we send."}
+      - {name: integration_category, type: STRING}
+      - {name: integration_object,   type: STRING}
+
+  - name: flows
+    table: flows
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,           type: STRING, mode: REQUIRED}
+      - {name: name,         type: STRING}
+      - {name: status,       type: STRING, description: "live | manual | draft."}
+      - {name: archived,     type: BOOLEAN}
+      - {name: trigger_type, type: STRING}
+      - {name: created,      type: TIMESTAMP}
+      - {name: updated,      type: TIMESTAMP}
+
+  - name: campaigns
+    table: campaigns
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,               type: STRING, mode: REQUIRED}
+      - {name: name,             type: STRING}
+      - {name: channel,          type: STRING, description: "email | sms — which channel pass returned it."}
+      - {name: status,           type: STRING}
+      - {name: archived,         type: BOOLEAN}
+      - {name: created_at,       type: TIMESTAMP}
+      - {name: updated_at,       type: TIMESTAMP}
+      - {name: scheduled_at,     type: TIMESTAMP}
+      - {name: send_time,        type: TIMESTAMP}
+      - {name: audiences,        type: JSON, description: "{included: [list ids], excluded: [list ids]}."}
+      - {name: send_options,     type: JSON}
+      - {name: send_strategy,    type: JSON}
+      - {name: tracking_options, type: JSON, description: "Carries add_utm / utm_params — a flow or campaign with add_utm false produces clicks with NO UTMs, which is why some Klaviyo-attributed revenue can never appear in a UTM-based channel model."}
+
+  - name: campaign_messages
+    table: campaign_messages
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,           type: STRING, mode: REQUIRED, description: "Matches events.attributed_campaign_message_id."}
+      - {name: campaign_id,  type: STRING, description: "Owning campaign."}
+      - {name: channel,      type: STRING}
+      - {name: label,        type: STRING, description: "Message / A-B variation label."}
+      - {name: subject,      type: STRING}
+      - {name: preview_text, type: STRING}
+      - {name: from_email,   type: STRING}
+      - {name: from_label,   type: STRING}
+      - {name: send_times,   type: JSON}
+      - {name: definition,   type: JSON, description: "The whole message definition, unmodified."}
+
+  - name: flow_messages
+    table: flow_messages
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,             type: STRING, mode: REQUIRED, description: "Matches events.attributed_flow_message_id."}
+      - {name: flow_id,        type: STRING}
+      - {name: flow_action_id, type: STRING}
+      - {name: channel,        type: STRING, description: "Klaviyo capitalises this one — 'Email' / 'SMS', not the lowercase form the campaign endpoints use."}
+      - {name: subject_line,   type: STRING, description: "A flow message has no `name`; the subject line is what identifies it to a human."}
+      - {name: preview_text,   type: STRING}
+      - {name: from_email,     type: STRING}
+      - {name: from_label,     type: STRING}
+      - {name: template_id,    type: STRING}
+      - {name: transactional,  type: BOOLEAN}
+      - {name: smart_sending_enabled, type: BOOLEAN}
+      - {name: add_tracking_params,   type: BOOLEAN, description: "FALSE means this message's links carry NO UTMs, so revenue Klaviyo attributes to it can never appear in a UTM-based channel model. The dunning flow's messages are the common case."}
+      - {name: created,        type: TIMESTAMP}
+      - {name: updated,        type: TIMESTAMP}
+      - {name: definition,     type: JSON, description: "The whole message definition, unmodified."}
+
+  - name: lists
+    table: lists
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,             type: STRING, mode: REQUIRED}
+      - {name: name,           type: STRING}
+      - {name: opt_in_process, type: STRING}
+      - {name: created,        type: TIMESTAMP}
+      - {name: updated,        type: TIMESTAMP}
+
+  # ---------------------------------------------------------------------
+  # profiles — incremental on `updated`
+  # ---------------------------------------------------------------------
+  - name: profiles
+    table: profiles
+    primary_key: id
+    write_disposition: merge
+    partition_by: none
+    incremental:
+      cursor_field: updated
+      cursor_type: timestamp
+      lookback: 6h
+      initial_value: "2020-01-01T00:00:00Z"
+      ordered: true        # /profiles sorts ascending on `updated` — a keyset walk
+    schema:
+      - {name: id,           type: STRING,    mode: REQUIRED}
+      - {name: updated,      type: TIMESTAMP, mode: REQUIRED}
+      - {name: created,      type: TIMESTAMP}
+      - {name: email,        type: STRING}
+      - {name: phone_number, type: STRING}
+      - {name: external_id,  type: STRING, description: "The app's own user id — the join key from Klaviyo to an internal customer table."}
+      - {name: first_name,   type: STRING}
+      - {name: last_name,    type: STRING}
+      - {name: organization, type: STRING}
+      - {name: title,        type: STRING}
+      - {name: locale,       type: STRING}
+      - {name: last_event_date, type: TIMESTAMP}
+      - {name: anonymous_id, type: STRING}
+      - {name: location,     type: JSON}
+      - {name: properties,   type: JSON, description: "Custom profile properties."}
+      # --- consent, flattened from `subscriptions` ------------------------
+      # Requested via additional-fields[profile]=subscriptions. Absent from a
+      # default /profiles response, so a connector that does not ask for it
+      # cannot answer "may we contact this person?" at all.
+      - {name: email_marketing_consent,           type: STRING,    description: "SUBSCRIBED / UNSUBSCRIBED / NEVER_SUBSCRIBED."}
+      - {name: email_marketing_can_receive,       type: BOOLEAN,   description: "Klaviyo's own verdict on whether marketing email may be sent. The addressability flag."}
+      - {name: email_marketing_consent_timestamp, type: TIMESTAMP}
+      - {name: email_marketing_method,            type: STRING,    description: "How consent was captured — PREFERENCE_PAGE, API, FORM, ..."}
+      - {name: email_marketing_suppressions,      type: JSON,      description: "Suppression reasons with timestamps (UNSUBSCRIBE, HARD_BOUNCE, SPAM_COMPLAINT...). Non-empty means email is blocked, and says why."}
+      - {name: sms_marketing_consent,             type: STRING}
+      - {name: sms_marketing_can_receive,         type: BOOLEAN}
+      - {name: sms_marketing_consent_timestamp,   type: TIMESTAMP}
+      - {name: subscriptions,                     type: JSON,      description: "The whole subscriptions object — email/sms/push, marketing + transactional + open/click tracking."}
+      # --- Klaviyo's predictive analytics ---------------------------------
+      - {name: predicted_clv,          type: FLOAT,   description: "Klaviyo's predicted customer lifetime value. NULL unless the account has enough order history."}
+      - {name: historic_clv,           type: FLOAT}
+      - {name: total_clv,              type: FLOAT}
+      - {name: churn_probability,      type: FLOAT}
+      - {name: expected_date_of_next_order, type: TIMESTAMP}
+      - {name: predictive_analytics,   type: JSON,    description: "The whole predictive_analytics object, unmodified."}
+
+  # ---------------------------------------------------------------------
+  # audiences — definitions and membership
+  # ---------------------------------------------------------------------
+  - name: segments
+    table: segments
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,            type: STRING, mode: REQUIRED}
+      - {name: name,          type: STRING}
+      - {name: is_active,     type: BOOLEAN}
+      - {name: is_processing, type: BOOLEAN}
+      - {name: is_starred,    type: BOOLEAN}
+      - {name: created,       type: TIMESTAMP}
+      - {name: updated,       type: TIMESTAMP}
+      - {name: definition,    type: JSON, description: "The audience logic itself — condition groups, the metrics and filters that define membership."}
+
+  - name: list_memberships
+    table: list_memberships
+    primary_key: [list_id, profile_id]
+    write_disposition: replace
+    schema:
+      - {name: list_id,     type: STRING, mode: REQUIRED}
+      - {name: profile_id,  type: STRING, mode: REQUIRED}
+      - {name: email,       type: STRING}
+      - {name: external_id, type: STRING, description: "Your own user id — makes membership joinable to a customer table directly."}
+      - {name: extracted_at, type: TIMESTAMP, mode: REQUIRED, description: "Membership is a point-in-time snapshot; this is when it was read."}
+
+  - name: segment_memberships
+    table: segment_memberships
+    primary_key: [segment_id, profile_id]
+    write_disposition: replace
+    schema:
+      - {name: segment_id,  type: STRING, mode: REQUIRED}
+      - {name: profile_id,  type: STRING, mode: REQUIRED}
+      - {name: email,       type: STRING}
+      - {name: external_id, type: STRING}
+      - {name: extracted_at, type: TIMESTAMP, mode: REQUIRED}
+
+  # ---------------------------------------------------------------------
+  # creative and organisation
+  # ---------------------------------------------------------------------
+  - name: templates
+    table: templates
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,          type: STRING, mode: REQUIRED}
+      - {name: name,        type: STRING}
+      - {name: editor_type, type: STRING}
+      - {name: html,        type: STRING, description: "The rendered template HTML. Large — drop this stream if you only need performance."}
+      - {name: text,        type: STRING}
+      - {name: created,     type: TIMESTAMP}
+      - {name: updated,     type: TIMESTAMP}
+
+  - name: tags
+    table: tags
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,           type: STRING, mode: REQUIRED}
+      - {name: name,         type: STRING}
+      - {name: campaign_ids, type: JSON, description: "Campaigns carrying this tag."}
+      - {name: flow_ids,     type: JSON}
+      - {name: list_ids,     type: JSON}
+      - {name: segment_ids,  type: JSON}
+
+  - name: forms
+    table: forms
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,         type: STRING, mode: REQUIRED}
+      - {name: name,       type: STRING}
+      - {name: status,     type: STRING}
+      - {name: ab_test,    type: BOOLEAN}
+      - {name: created_at, type: TIMESTAMP}
+      - {name: updated_at, type: TIMESTAMP}
+
+  - name: account
+    table: account
+    primary_key: id
+    write_disposition: replace
+    schema:
+      - {name: id,                 type: STRING, mode: REQUIRED}
+      - {name: organization_name,  type: STRING}
+      - {name: timezone,           type: STRING, description: "The account timezone. Klaviyo's UI reports by this, so a warehouse comparison in UTC will disagree at day boundaries unless it is applied."}
+      - {name: preferred_currency, type: STRING}
+      - {name: industry,           type: STRING}
+      - {name: locale,             type: STRING}
+      - {name: public_api_key,     type: STRING}
+      - {name: test_account,       type: BOOLEAN}
+      - {name: contact_information, type: JSON}
+
+  # ---------------------------------------------------------------------
+  # Reporting API — the numbers Klaviyo's own UI shows
+  # ---------------------------------------------------------------------
+  # These reproduce the app 1:1. Query Metric Aggregates (and any count built
+  # from the raw event stream) buckets by when the event HAPPENED; the UI
+  # buckets by SEND DATE. That is why an event-derived open rate never quite
+  # matches the screen an email team is looking at. Conversion statistics are
+  # computed against `conversion_metric_id`.
+  - name: campaign_reports
+    table: campaign_reports
+    primary_key: [campaign_id, campaign_message_id, send_channel]
+    write_disposition: replace
+    schema:
+      - {name: campaign_id,         type: STRING, mode: REQUIRED}
+      - {name: campaign_message_id, type: STRING, mode: REQUIRED}
+      - {name: send_channel,        type: STRING, mode: REQUIRED}
+      - {name: timeframe,           type: STRING, description: "The timeframe key this report covers."}
+      - {name: conversion_metric_id, type: STRING}
+      - {name: extracted_at,        type: TIMESTAMP, mode: REQUIRED}
+      - {name: statistics,          type: JSON, description: "Every requested statistic, as returned."}
+
+  - name: flow_reports
+    table: flow_reports
+    primary_key: [flow_id, flow_message_id, send_channel]
+    write_disposition: replace
+    schema:
+      - {name: flow_id,          type: STRING, mode: REQUIRED}
+      - {name: flow_message_id,  type: STRING, mode: REQUIRED}
+      - {name: send_channel,     type: STRING, mode: REQUIRED}
+      - {name: timeframe,        type: STRING}
+      - {name: conversion_metric_id, type: STRING}
+      - {name: extracted_at,     type: TIMESTAMP, mode: REQUIRED}
+      - {name: statistics,       type: JSON}
+
+  - name: segment_reports
+    table: segment_reports
+    primary_key: [segment_id]
+    write_disposition: replace
+    schema:
+      - {name: segment_id,   type: STRING, mode: REQUIRED}
+      - {name: timeframe,    type: STRING}
+      - {name: extracted_at, type: TIMESTAMP, mode: REQUIRED}
+      - {name: statistics,   type: JSON, description: "total_members, members_added, members_removed, net_members_changed."}
+
+schedule: daily

@@ -549,3 +549,113 @@ def test_event_window_tolerates_clock_skew_and_defers_tail_without_loss(
     )
     assert extract(resumed) == {"A-old", "B-old", "A-tail", "B-tail"}
     assert len({upper for _, upper in requests[2:]}) == 1
+
+
+def test_profiles_preserve_unpromoted_payloads_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile migration must retain unknown fields and links, not only promotions."""
+    import logging
+    from pathlib import Path
+
+    import dtex.sources.klaviyo.source as source_module
+    from dtex.types import Config, Cursor, CursorType
+
+    manifest = ConnectorManifest.from_dict(
+        yaml.safe_load(Path(source_module.__file__).with_name("register.yaml").read_text())
+    )
+    stream_def = next(item for item in manifest.streams if item.name == "profiles")
+    records = [
+        {
+            "id": "p1",
+            "attributes": {
+                "updated": "2026-09-11T12:00:00Z", "external_id": "customer-1",
+                "unpromoted_attribute": {"nested": [1, "arbitrary"]},
+                "properties": {"Business focus": "Research", "$source": "form"},
+                "subscriptions": {"email": {"marketing": {"consent": "SUBSCRIBED"}}},
+            },
+            "relationships": {"lists": {"links": {"related": "https://example.test/lists"}}},
+            "links": {"self": "https://example.test/profiles/p1"},
+        },
+        {"id": "p2", "attributes": {"updated": "2026-09-11T13:00:00Z"}},
+    ]
+
+    class Client:
+        def __enter__(self) -> Client:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            pass
+
+        def pages(self, path: str, params: dict[str, Any]) -> Any:
+            assert path == "profiles/"
+            assert params["sort"] == "updated"
+            assert params["additional-fields[profile]"] == "subscriptions"
+            for record in records:
+                yield {"data": [record]}
+
+    monkeypatch.setattr(source_module, "_build_client", lambda config, log: Client())
+    cursor = Cursor(cursor_field="updated", cursor_type=CursorType.TIMESTAMP)
+    actual = [
+        record
+        for batch in source_module.profiles(
+            stream_def=stream_def,
+            config=Config(params={"profile_additional_fields": "subscriptions", "batch_size": 1}),
+            cursor=cursor, log=logging.getLogger("test"),
+        )
+        for record in batch
+    ]
+    assert len(actual) == 2
+    for raw, landed in zip(records, actual, strict=True):
+        assert landed["attributes"] == raw["attributes"]
+        assert landed["relationships"] == raw.get("relationships", {})
+        assert landed["links"] == raw.get("links", {})
+    assert actual[0]["external_id"] == "customer-1"
+    assert actual[0]["email_marketing_consent"] == "SUBSCRIBED"
+    assert actual[1]["email_marketing_consent"] is None
+    assert cursor.observed_max is not None
+
+
+@pytest.mark.parametrize("stream_name", ["metrics", "flows", "lists"])
+def test_catalog_projection_preserves_raw_payloads(
+    monkeypatch: pytest.MonkeyPatch, stream_name: str,
+) -> None:
+    """The declared schema must not discard payloads before destination writes."""
+    import logging
+    from pathlib import Path
+
+    import dtex.sources.klaviyo.source as source_module
+    from dtex.types import Config
+
+    manifest = ConnectorManifest.from_dict(
+        yaml.safe_load(Path(source_module.__file__).with_name("register.yaml").read_text())
+    )
+    stream_def = next(item for item in manifest.streams if item.name == stream_name)
+    raw = {
+        "id": "resource-1", "attributes": {"name": "Example", "future_field": [1, 2]},
+        "relationships": {"tags": {"links": {"related": "https://example.test/tags"}}},
+        "links": {"self": "https://example.test/resource-1"},
+    }
+
+    class Client:
+        def __enter__(self) -> Client:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            pass
+
+        def pages(self, path: str, params: Any = None) -> Any:
+            assert path == stream_name + "/"
+            yield {"data": [raw]}
+
+    monkeypatch.setattr(source_module, "_build_client", lambda config, log: Client())
+    actual = [
+        record
+        for batch in getattr(source_module, stream_name)(
+            stream_def=stream_def, config=Config(params={}), log=logging.getLogger("test"),
+        )
+        for record in batch
+    ]
+    assert len(actual) == 1
+    for column in ("attributes", "relationships", "links"):
+        assert actual[0][column] == raw[column]

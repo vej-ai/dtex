@@ -184,3 +184,9 @@ revenue Klaviyo attributes to them can never appear in a UTM-based channel
 model, no matter how the warehouse is queried. Dunning/transactional flows are
 the common case. Both columns are landed so the gap is measurable rather than
 mysterious.
+
+
+Profile records preserve their complete `attributes`, `relationships`, and
+top-level `links` JSON alongside typed identity, consent, and prediction fields.
+Existing incremental destinations receive these payloads when each profile is
+next fetched; replay a bounded history window if older rows need enrichment.

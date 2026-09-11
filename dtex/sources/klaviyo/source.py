@@ -597,6 +597,7 @@ def metrics(stream_def: StreamDef, config: Config, log: logging.Logger) -> Itera
                         "integration_object": integration.get("object"),
                         "attributes": attrs,
                         "relationships": item.get("relationships") or {},
+                        "links": item.get("links") or {},
                     }
                 )
     log.info("klaviyo.metrics: %d metric(s)", len(out))
@@ -624,6 +625,7 @@ def flows(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iterato
                         "updated": attrs.get("updated"),
                         "attributes": attrs,
                         "relationships": item.get("relationships") or {},
+                        "links": item.get("links") or {},
                     }
                 )
     log.info("klaviyo.flows: %d flow(s)", len(out))
@@ -839,6 +841,7 @@ def lists(stream_def: StreamDef, config: Config, log: logging.Logger) -> Iterato
                         "updated": attrs.get("updated"),
                         "attributes": attrs,
                         "relationships": item.get("relationships") or {},
+                        "links": item.get("links") or {},
                     }
                 )
     log.info("klaviyo.lists: %d list(s)", len(out))
@@ -1297,6 +1300,11 @@ def profiles(
                     "anonymous_id": attrs.get("anonymous_id"),
                     "location": attrs.get("location"),
                     "properties": attrs.get("properties"),
+                    # Keep fields the connector does not promote, including
+                    # new API fields and profile relationship links.
+                    "attributes": attrs,
+                    "relationships": item.get("relationships") or {},
+                    "links": item.get("links") or {},
                 }
                 record.update(_consent_columns(attrs.get("subscriptions")))
                 record.update(_predictive_columns(attrs.get("predictive_analytics")))

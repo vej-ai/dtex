@@ -10,6 +10,16 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.14.2] — 2026-09-11
+
+### Fixed
+
+- Klaviyo profiles retain full `attributes`, `relationships`, and `links`
+  payloads alongside typed columns, preserving unpromoted fields during
+  migration and future API additions.
+- Klaviyo list payloads survive schema projection; metrics, flows, and
+  lists also preserve their top-level JSON:API links.
+
 ## [0.14.1] — 2026-09-11
 
 ### Fixed
@@ -1272,7 +1282,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.2...HEAD
+[0.14.2]: https://github.com/vej-ai/dtex/releases/tag/v0.14.2
 [0.14.1]: https://github.com/vej-ai/dtex/releases/tag/v0.14.1
 [0.14.0]: https://github.com/vej-ai/dtex/releases/tag/v0.14.0
 [0.13.0]: https://pypi.org/project/dtex/0.13.0/

@@ -281,6 +281,7 @@ streams:
       - {name: integration_object,   type: STRING}
       - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
       - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
+      - {name: links, type: JSON, description: "Top-level JSON:API links, unmodified."}
 
   - name: flows
     table: flows
@@ -296,6 +297,7 @@ streams:
       - {name: updated,      type: TIMESTAMP}
       - {name: attributes,    type: JSON, description: "The object's entire `attributes` payload exactly as Klaviyo returned it. Full fidelity on purpose: a connector cannot know which fields an account uses or which Klaviyo adds next, so nothing is filtered out."}
       - {name: relationships, type: JSON, description: "The object's entire `relationships` payload, unmodified."}
+      - {name: links, type: JSON, description: "Top-level JSON:API links, unmodified."}
 
   - name: campaigns
     table: campaigns
@@ -370,6 +372,10 @@ streams:
       - {name: created,        type: TIMESTAMP}
       - {name: updated,        type: TIMESTAMP}
 
+      - {name: attributes, type: JSON, description: "The complete attributes payload, unmodified."}
+      - {name: relationships, type: JSON, description: "The complete relationships payload, unmodified."}
+      - {name: links, type: JSON, description: "Top-level JSON:API links, unmodified."}
+
   # ---------------------------------------------------------------------
   # profiles — incremental on `updated`
   # ---------------------------------------------------------------------
@@ -400,6 +406,9 @@ streams:
       - {name: anonymous_id, type: STRING}
       - {name: location,     type: JSON}
       - {name: properties,   type: JSON, description: "Custom profile properties."}
+      - {name: attributes, type: JSON, description: "The complete profile attributes, including fields without typed promotions."}
+      - {name: relationships, type: JSON, description: "The complete profile relationships, unmodified."}
+      - {name: links, type: JSON, description: "The profile's top-level JSON:API links, unmodified."}
       # --- consent, flattened from `subscriptions` ------------------------
       # Requested via additional-fields[profile]=subscriptions. Absent from a
       # default /profiles response, so a connector that does not ask for it

@@ -10,6 +10,20 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.14.1] — 2026-09-11
+
+### Fixed
+
+- Klaviyo event queries end one minute before the run starts, avoiding
+  future-date validation errors when the runner and API clocks differ.
+  All metrics retain a shared upper bound, and the next incremental run
+  fetches the deferred events through the existing three-day lookback.
+
+### Documentation
+
+- Connector-authoring guidance now explains preserving tenant-defined
+  properties as raw payloads and making typed promotions optional.
+
 ## [0.14.0] — 2026-09-11
 
 ### Changed
@@ -1258,7 +1272,10 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.12.7...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/vej-ai/dtex/releases/tag/v0.14.1
+[0.14.0]: https://github.com/vej-ai/dtex/releases/tag/v0.14.0
+[0.13.0]: https://pypi.org/project/dtex/0.13.0/
 [0.12.7]: https://github.com/vej-ai/dtex/releases/tag/v0.12.7
 [0.12.6]: https://github.com/vej-ai/dtex/releases/tag/v0.12.6
 [0.12.5]: https://github.com/vej-ai/dtex/releases/tag/v0.12.5

@@ -80,6 +80,11 @@ Three declarations fix it, and they only work together:
 Widen `lookback` if the delay grows; merge makes re-walking idempotent, so the
 only cost is API calls.
 
+The events upper bound is fixed one minute before the run starts. This
+leaves room for clock differences that otherwise cause Klaviyo to reject the
+query as future-dated. The newest minute is deferred to the next sync and
+recovered by the normal lookback; the bound remains identical across metrics.
+
 ## Streams
 
 | stream | disposition | notes |

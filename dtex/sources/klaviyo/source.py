@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from dtex import Batch, Config, Cursor, StreamDef, stream
@@ -428,7 +428,11 @@ def events(
     # timestamps between the two — are never revisited and are lost. Bounding
     # every pass at the same instant makes the committed cursor mean "every
     # metric has been read up to here".
-    run_ceiling = _utc_now()
+    # Klaviyo rejects an upper bound it considers future-dated. Leave a
+    # minute of headroom for clock differences between the runner and API.
+    # The next incremental lookback fetches this deferred tail; every metric
+    # still shares one fixed ceiling for this run.
+    run_ceiling = (datetime.fromisoformat(_utc_now()) - timedelta(minutes=1)).isoformat()
     filters: list[str] = [f"less-than(datetime,{_as_iso(run_ceiling)})"]
     if start:
         filters.append(f"greater-or-equal(datetime,{_as_iso(start)})")

@@ -458,3 +458,94 @@ def test_events_stream_is_unordered_with_a_lookback() -> None:
     assert events["primary_key"] == "id"
     assert events["incremental"]["ordered"] is False
     assert events["incremental"]["lookback"] == "3d"
+
+
+def test_event_window_tolerates_clock_skew_and_defers_tail_without_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slightly fast runner must not request future events or skip its deferred tail."""
+    import logging
+    import re
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+
+    import dtex.sources.klaviyo.source as source_module
+    from dtex.engine.runner import _seed_value
+    from dtex.sources.klaviyo.client import KlaviyoAPIError
+    from dtex.types import Config, Cursor, CursorType, StateRecord
+
+    manifest = ConnectorManifest.from_dict(
+        yaml.safe_load(Path(source_module.__file__).with_name("register.yaml").read_text())
+    )
+    stream_def = next(item for item in manifest.streams if item.name == "events")
+    server_now = datetime(2026, 9, 11, 12, tzinfo=UTC)
+    runner_now = server_now + timedelta(seconds=30)
+    requests: list[tuple[str, datetime]] = []
+    records = {}
+    for metric, seconds in (("A", -90), ("B", -120)):
+        old = _event(metric + "-old", None)
+        old["attributes"]["datetime"] = (server_now + timedelta(seconds=seconds)).isoformat()
+        late = _event(metric + "-tail", None)
+        late["attributes"]["datetime"] = (server_now - timedelta(seconds=10)).isoformat()
+        records[metric] = [old, late]
+
+    class Client:
+        def __enter__(self) -> Client:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            pass
+
+        def pages(self, path: str, params: dict[str, Any]) -> Any:
+            nonlocal runner_now
+            assert path == "events/"
+            upper_match = re.search(r"less-than\(datetime,([^)]+)\)", params["filter"])
+            lower_match = re.search(r"greater-or-equal\(datetime,([^)]+)\)", params["filter"])
+            metric_match = re.search(r'equals\(metric_id,"([^"]+)"\)', params["filter"])
+            assert upper_match and lower_match and metric_match
+            upper = datetime.fromisoformat(upper_match[1])
+            lower = datetime.fromisoformat(lower_match[1])
+            metric = metric_match[1]
+            requests.append((metric, upper))
+            if upper > server_now:
+                raise KlaviyoAPIError(400, "End date may not be in the future")
+            yield {"data": [
+                record for record in records[metric]
+                if lower <= datetime.fromisoformat(record["attributes"]["datetime"]) < upper
+            ]}
+            # A long first metric must not change the shared bound for the second.
+            runner_now += timedelta(minutes=2)
+
+    monkeypatch.setattr(source_module, "_utc_now", lambda: runner_now.isoformat())
+    monkeypatch.setattr(source_module, "_build_client", lambda config, log: Client())
+    config = Config(params={"metric_ids": "A,B"})
+
+    def extract(cursor: Cursor) -> set[str]:
+        return {
+            record["id"]
+            for batch in source_module.events(
+                config=config, cursor=cursor, log=logging.getLogger("test"),
+                stream_def=stream_def,
+            )
+            for record in batch
+        }
+
+    cursor = Cursor(
+        cursor_field="datetime", cursor_type=CursorType.TIMESTAMP,
+        start_value=server_now - timedelta(hours=1),
+    )
+    assert extract(cursor) == {"A-old", "B-old"}
+    assert len({upper for _, upper in requests}) == 1
+
+    prior = StateRecord(
+        connector="klaviyo", stream="events", cursor_value=cursor.observed_max,
+        cursor_type=CursorType.TIMESTAMP,
+    )
+    server_now += timedelta(hours=1)
+    runner_now = server_now + timedelta(seconds=30)
+    resumed = Cursor(
+        cursor_field="datetime", cursor_type=CursorType.TIMESTAMP,
+        start_value=_seed_value(prior, CursorType.TIMESTAMP, None, stream_def.incremental),
+    )
+    assert extract(resumed) == {"A-old", "B-old", "A-tail", "B-tail"}
+    assert len({upper for _, upper in requests[2:]}) == 1

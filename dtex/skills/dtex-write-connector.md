@@ -168,6 +168,45 @@ but it does not reshape nested dicts into flat columns. If the API returns
 `{"attributes": {"country": "US"}}` and your schema declares
 `country: STRING`, you must flatten in the `@stream` function before yielding.
 
+**4. Type what the API guarantees; land the rest whole.**
+A connector is written once and pointed at many accounts. Type only the
+fields the vendor guarantees for *every* tenant — ids, timestamps,
+relationships, the vendor's own reserved keys — and land every payload
+unmodified in a `JSON` column beside them.
+
+The trap is a free-text bag: Klaviyo's `event_properties`, Intercom's
+`custom_attributes`, Segment's `traits`, a webhook's `metadata`. Its
+contents are **whatever that tenant's integrations emit**. Typing the
+fields you happen to need fits the connector to one account: a Stripe
+integration emits `Invoice` and `$extra`, a Shopify one emits `OrderId`
+and `SKU`, an in-house one emits something else entirely. Columns fitted
+to the first account are NULL everywhere else, and the fields that matter
+to everyone else are invisible — silently, because the table looks
+complete.
+
+```yaml
+# Right: the vendor's guarantees as columns, the tenant's data intact.
+- {name: id,         type: STRING, mode: REQUIRED}
+- {name: occurred_at, type: TIMESTAMP, mode: REQUIRED}
+- {name: properties, type: JSON, description: "Whole payload, unmodified."}
+- {name: raw,        type: JSON, description: "The entire object as returned."}
+```
+
+Two things this buys beyond fidelity:
+
+* **Schema evolution for free.** A field the vendor adds next quarter is
+  already landed; no connector release is needed to see it.
+* **A migration path.** A project moving off another connector can keep
+  its existing `JSON_VALUE(raw, '$.some.path')` extractions working
+  against your column, instead of rewriting every model.
+
+Offer a `promote_properties`-style param (`column=json.path` pairs,
+**empty by default**) so an operator can lift the paths *their* account
+queries often into real columns. Promoted names are not in
+`register.yaml` — they are per-deployment — so append them to the
+projection at run time, or `_project`-style filtering will build the
+values and then silently drop them.
+
 ## Dual-API connectors — when one source serves two surfaces
 
 Some APIs come in two flavors that the same operator pulls from in one

@@ -56,6 +56,7 @@ from concurrent.futures import (
     wait,
 )
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from io import StringIO
 from pathlib import Path
@@ -535,6 +536,25 @@ def _resolve_partition(
     return None
 
 
+def _merge_configured_schema(
+    base: Schema, additions: Schema, *, inferred: bool = False
+) -> Schema:
+    """Add configured fields without mutating the source's shared contract."""
+    fields = {item.name: item for item in base.fields}
+    for item in additions.fields:
+        declared = fields.get(item.name)
+        if declared is not None and not inferred:
+            if (declared.type, declared.mode) != (item.type, item.mode):
+                raise EngineError(
+                    f"configured schema field {item.name!r} conflicts with the source's "
+                    f"declared {declared.type.value}/{declared.mode.value}; "
+                    "schema additions cannot change declared types or modes"
+                )
+            continue
+        fields[item.name] = item
+    return Schema(fields=tuple(fields.values()))
+
+
 def _validate_streams_block(
     pipeline: PipelineConfig, source: disc.LoadedConnector
 ) -> None:
@@ -580,6 +600,9 @@ def _validate_streams_block(
     # opposite (mode=full_refresh on an incremental-capable stream) is
     # always allowed — that's the §3.1 escape hatch.
     for stream_name, stream_run in pipeline.streams.items():
+        declared = streams_by_name[stream_name].schema
+        if stream_run.schema is not None and declared is not None:
+            _merge_configured_schema(declared, stream_run.schema)
         if stream_run.mode is StreamMode.INCREMENTAL:
             stream_def = streams_by_name[stream_name]
             if not stream_def.is_incremental:
@@ -980,6 +1003,11 @@ def _run_one_stream(
     signal a heartbeat should track (between-batch beats also avoid any
     thread-safety concern with the single-threaded destination client).
     """
+    configured_schema = pipeline.streams.get(stream_def.name, StreamRunConfig()).schema
+    if configured_schema is not None and stream_def.schema is not None:
+        stream_def = replace(
+            stream_def, schema=_merge_configured_schema(stream_def.schema, configured_schema)
+        )
     registration = source.registry.stream(stream_def.name)
     if registration is None:  # pragma: no cover — validate_connector caught it.
         raise EngineError(f"stream {stream_def.name!r} has no registered @stream function")
@@ -1064,6 +1092,14 @@ def _run_one_stream(
         resolved_schema = _infer_schema(first_batch)
     else:
         resolved_schema = stream_def.schema if stream_def.schema is not None else Schema()
+
+    # Preserve inference for every unconfigured field on schemaless sources.
+    # Declared-source additions were applied before injection so projections
+    # also see the configured columns, including an all-null first batch.
+    if stream_def.schema is None and configured_schema is not None:
+        resolved_schema = _merge_configured_schema(
+            resolved_schema, configured_schema, inferred=True
+        )
 
     # NORMALIZE drift policy for this run (docs/02 §Normalize). ``warn`` (the
     # default) coerces-or-nulls a value that contradicts its declared type and

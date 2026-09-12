@@ -56,6 +56,16 @@ error (as of v0.1.4) — read it before guessing.
 
 ## 4. Common error patterns
 
+### Promoted numeric column inferred as STRING
+
+If BigQuery MERGE reports that STRING cannot be assigned to a numeric column,
+check account-specific promoted fields. A null-only first batch cannot infer
+its eventual numeric type. Add the column to `streams.<name>.schema`, using
+its existing destination-compatible portable type, for example
+`- {name: invoice_total, type: FLOAT}`. Retain the raw JSON payload. Do not
+change the existing warehouse column to STRING to accommodate one batch.
+
+
 ### `ArrowInvalid: Could not convert '1599' with type str: tried to convert to int64`
 
 A column the API returns as a string is declared as `INTEGER` in the

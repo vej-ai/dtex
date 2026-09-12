@@ -59,7 +59,7 @@ A mapping `{stream_name: per-stream-overrides}`. Each value can be:
 
 - **null / empty mapping** — include the stream with defaults
 - **a bare string** (`my_stream: full_refresh`) — shorthand for `{mode: <string>}`
-- **a mapping** with any subset of `mode`, `since`, `params`, `partition`
+- **a mapping** with any subset of `mode`, `since`, `params`, `partition`, `schema`
 
 ```yaml
 name: revenuecat_dev_bq
@@ -121,6 +121,28 @@ Destination partition spec for this stream. Replaces what
 `partition_overrides[<stream>]` did before the redesign. Short string
 form (`partition: created`) defaults to TIME+DAY. Long-form mapping
 gives full control over `type` / `range` / `granularity`.
+
+### `schema: [{name, type, mode?, description?}, ...]`
+
+Add typed account-specific columns, such as Klaviyo promoted properties, to
+this stream's source schema. Source-declared fields remain present; an entry
+for an existing field must retain its declared type and mode. On a schemaless
+source only the configured fields override inference; other fields still infer.
+
+```yaml
+streams:
+  events:
+    schema:
+      - {name: invoice_id, type: STRING}
+      - {name: payment_intent, type: STRING}
+      - {name: invoice_total, type: FLOAT}
+```
+
+Use portable dtex types (`FLOAT`, not BigQuery's `FLOAT64`). This prevents an
+all-null first batch from inferring a numeric promoted column as STRING and
+breaking a later BigQuery MERGE. The additions apply before source projection
+and normalization. They do not replace the source schema or change existing
+warehouse types. Duplicate, empty, and `_dtex_synced_at` names are rejected.
 
 ## Param precedence (full picture)
 

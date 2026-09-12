@@ -10,6 +10,18 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.14.4] — 2026-09-12
+
+- Fix promoted-column type drift with additive `streams.<name>.schema`
+  declarations. Null-only first batches now retain configured portable types,
+  preventing a STRING staging column from failing a numeric BigQuery MERGE.
+- Preserve source-declared columns, types, and modes; validate conflicting or
+  duplicate declarations before extraction. Schemaless sources keep inference
+  for all unconfigured columns. Source manifests remain immutable across runs.
+- Document typed Klaviyo promotions and update the bundled config/debug skills.
+  Regression coverage includes null-first batches, numeric strings, repeated
+  merges into new/existing tables, and declared-schema protection.
+
 ## [0.14.3] — 2026-09-12
 
 - Fix full-table BigQuery scans for merges whose partition column belongs to
@@ -1295,7 +1307,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.3...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.4...HEAD
+[0.14.4]: https://github.com/vej-ai/dtex/releases/tag/v0.14.4
 [0.14.3]: https://github.com/vej-ai/dtex/releases/tag/v0.14.3
 [0.14.2]: https://github.com/vej-ai/dtex/releases/tag/v0.14.2
 [0.14.1]: https://github.com/vej-ai/dtex/releases/tag/v0.14.1

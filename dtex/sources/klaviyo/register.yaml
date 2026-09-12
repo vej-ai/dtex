@@ -146,8 +146,9 @@ params:
       invented — so no built-in list can be right for everyone. Nothing is
       ever lost by leaving this empty: the whole payload is always landed in
       `event_properties`, and promotions are a query-convenience layer on
-      top. Declare the matching columns in a `schema` override, or read them
-      back out of the JSON.
+      top. Declare matching portable types in `streams.events.schema`
+      (e.g. `{name: invoice_total, type: FLOAT}`) so null-only batches cannot
+      infer the wrong type, or read the values back out of the JSON.
   event_include_profile:
     type: bool
     default: true

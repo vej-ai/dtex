@@ -2168,12 +2168,16 @@ class StreamRunConfig:
       as ``StreamDef.partition_by`` (string short form OR
       :class:`PartitionConfig` long form). Overrides whatever the
       source declares for this stream.
+    * ``schema`` — typed additions to the source schema, for promoted or
+      account-specific fields. Existing declared types/modes cannot change;
+      on schemaless sources these fields override inference only.
     """
 
     mode: StreamMode | None = None
     since: Any | None = None
     params: Mapping[str, Any] = field(default_factory=dict)
     partition: PartitionConfig | None = None
+    schema: Schema | None = None
 
     @classmethod
     def from_yaml_value(cls, value: Any, *, stream_name: str, config_name: str) -> StreamRunConfig:
@@ -2185,7 +2189,7 @@ class StreamRunConfig:
         * A bare string (``my_stream: full_refresh``) — interpreted as
           ``{mode: <string>}``.
         * A mapping with any subset of {``mode``, ``since``, ``params``,
-          ``partition``}.
+          ``partition``, ``schema``}.
 
         Unknown sub-keys are rejected (matches the codebase's "unknown
         YAML key is a hard error" stance — catches typos like ``mod``).
@@ -2201,7 +2205,7 @@ class StreamRunConfig:
                 f"config {config_name!r}: streams[{stream_name!r}] must be a "
                 f"mapping, a bare mode string, or null; got {type(value).__name__}"
             )
-        known = {"mode", "since", "params", "partition"}
+        known = {"mode", "since", "params", "partition", "schema"}
         unknown = set(value) - known
         if unknown:
             raise ValueError(
@@ -2245,11 +2249,30 @@ class StreamRunConfig:
                 f"got {type(partition_raw).__name__}"
             )
 
+        schema_raw = value.get("schema")
+        schema = None
+        if schema_raw is not None:
+            context = f"config {config_name!r}: streams[{stream_name!r}].schema"
+            if not isinstance(schema_raw, list) or any(
+                not isinstance(item, Mapping) for item in schema_raw
+            ):
+                raise ValueError(f"{context} must be a list of field mappings")
+            try:
+                schema = Schema.from_list(schema_raw)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"{context}: {exc}") from exc
+            assert schema is not None
+            if len(set(schema.names)) != len(schema.names):
+                raise ValueError(f"{context}: duplicate field names")
+            if any(not name.strip() or name == Schema.SYNCED_AT_COLUMN for name in schema.names):
+                raise ValueError(f"{context}: empty or reserved field name")
+
         return cls(
             mode=mode,
             since=value.get("since"),
             params=dict(params_raw),
             partition=partition,
+            schema=schema,
         )
 
 

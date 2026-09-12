@@ -256,3 +256,20 @@ The engine calls `load_config` in step 1 (DISCOVER) of the run lifecycle (docs/0
 ## 8. The runtime type
 
 The parsed config is exposed as `dtex.types.PipelineConfig` — a frozen dataclass. The engine builds one of these per run; connector authors never construct them. Re-exported as `dtex.PipelineConfig` for advanced library use.
+
+### Typed account-specific columns
+
+`streams.<name>.schema` accepts an additive list of ordinary `{name, type,
+mode?, description?}` schema fields. It preserves source-declared columns and
+requires their existing types/modes when names overlap. For schemaless sources,
+only the configured fields override inferred types. Use this for promoted
+JSON properties that may be null throughout the first batch:
+
+```yaml
+streams:
+  events:
+    schema:
+      - {name: invoice_total, type: FLOAT}
+```
+
+The source manifest stays immutable and other pipelines remain unaffected.

@@ -455,7 +455,7 @@ def test_events_stream_is_unordered_with_a_lookback() -> None:
     events = next(s for s in raw["streams"] if s["name"] == "events")
 
     assert events["write_disposition"] == "merge"
-    assert events["primary_key"] == "id"
+    assert events["primary_key"] == ["id", "datetime"]
     assert events["incremental"]["ordered"] is False
     assert events["incremental"]["lookback"] == "3d"
 
@@ -616,7 +616,9 @@ def test_profiles_preserve_unpromoted_payloads_across_pages(
     assert cursor.observed_max is not None
 
 
-@pytest.mark.parametrize("stream_name", ["metrics", "flows", "lists"])
+@pytest.mark.parametrize(
+    "stream_name", ["metrics", "flows", "lists", "campaigns", "campaign_messages", "flow_messages"]
+)
 def test_catalog_projection_preserves_raw_payloads(
     monkeypatch: pytest.MonkeyPatch, stream_name: str,
 ) -> None:
@@ -645,8 +647,16 @@ def test_catalog_projection_preserves_raw_payloads(
             pass
 
         def pages(self, path: str, params: Any = None) -> Any:
-            assert path == stream_name + "/"
-            yield {"data": [raw]}
+            if stream_name in {"campaigns", "campaign_messages"}:
+                assert path == "campaigns/"
+                yield {"data": [raw], "included": [dict(raw, type="campaign-message")]}
+            elif stream_name == "flow_messages":
+                assert path in {"flows/", "flows/resource-1/flow-actions/",
+                                "flow-actions/resource-1/flow-messages/"}
+                yield {"data": [raw]}
+            else:
+                assert path == stream_name + "/"
+                yield {"data": [raw]}
 
     monkeypatch.setattr(source_module, "_build_client", lambda config, log: Client())
     actual = [
@@ -656,6 +666,9 @@ def test_catalog_projection_preserves_raw_payloads(
         )
         for record in batch
     ]
-    assert len(actual) == 1
-    for column in ("attributes", "relationships", "links"):
-        assert actual[0][column] == raw[column]
+    assert actual
+    for record in actual:
+        for column in ("attributes", "relationships"):
+            assert record[column] == raw[column]
+        if stream_name in {"metrics", "flows", "lists"}:
+            assert record["links"] == raw["links"]

@@ -190,3 +190,10 @@ Profile records preserve their complete `attributes`, `relationships`, and
 top-level `links` JSON alongside typed identity, consent, and prediction fields.
 Existing incremental destinations receive these payloads when each profile is
 next fetched; replay a bounded history window if older rows need enrichment.
+
+
+BigQuery event merges use the immutable `(id, datetime)` key to prune the
+target to each batch's event dates. Event IDs remain globally unique; the
+timestamp component permits this optimization without treating a mutable
+partition column as immutable. Historical replays use their historical batch
+bounds, not a fixed recent-date cutoff.

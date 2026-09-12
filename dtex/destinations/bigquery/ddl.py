@@ -248,6 +248,8 @@ def merge_sql(
     staging_table: str,
     primary_key: tuple[str, ...],
     columns: tuple[str, ...],
+    partition_field: str | None = None,
+    partition_type: str | None = None,
 ) -> str:
     """Build the ``MERGE INTO target USING staging ON pk ...`` statement — docs/05 §4.
 
@@ -262,6 +264,9 @@ def merge_sql(
     statement is safe to interpolate column names into; values never appear
     in this SQL — the data was loaded into ``staging_table`` via a parameter-
     free Parquet LOAD job.
+
+    Optional partition bounds prune only a partition column contained in the
+    merge key. Bounds are read from the small staging table before MERGE.
     """
     if not primary_key:
         raise ValueError("merge_sql requires a non-empty primary_key")
@@ -276,6 +281,30 @@ def merge_sql(
         f"T.{quote_identifier(k, kind='column')} = S.{quote_identifier(k, kind='column')}"
         for k in primary_key
     )
+
+    # A partition predicate is safe only when the partition column belongs
+    # to the merge key. Otherwise an update moving a row between partitions
+    # could miss its old row and insert a duplicate.
+    preamble = ""
+    if partition_field is not None:
+        if partition_field not in primary_key or partition_field not in columns:
+            raise ValueError("merge partition field must belong to the primary key and columns")
+        if partition_type not in {"TIMESTAMP", "DATE", "INT64"}:
+            raise ValueError("merge partition type must be TIMESTAMP, DATE or INT64")
+        qpart = quote_identifier(partition_field, kind="column")
+        preamble = (
+            f"DECLARE dtex_partition_min {partition_type};\n"
+            f"DECLARE dtex_partition_max {partition_type};\n"
+            f"SET (dtex_partition_min, dtex_partition_max) = "
+            f"(SELECT AS STRUCT MIN({qpart}), MAX({qpart}) FROM {staging});\n"
+        )
+        # Script variables become static predicates for the MERGE child job,
+        # allowing BigQuery to prune the target to this batch's partitions.
+        on_clause += (
+            f" AND T.{qpart} BETWEEN dtex_partition_min AND dtex_partition_max"
+        )
+    elif partition_type is not None:
+        raise ValueError("merge partition type requires a partition field")
 
     pk_set = set(primary_key)
     update_cols = [c for c in columns if c not in pk_set]
@@ -320,7 +349,7 @@ def merge_sql(
     parts.append(
         f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
     )
-    return "\n".join(parts)
+    return preamble + "\n".join(parts)
 
 
 # --------------------------------------------------------------------------

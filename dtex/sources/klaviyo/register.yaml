@@ -226,7 +226,9 @@ streams:
   # ---------------------------------------------------------------------
   - name: events
     table: events
-    primary_key: id
+    # Event datetime is immutable. Keeping it in the merge key enables safe
+    # partition pruning while retaining one row per globally unique event ID.
+    primary_key: [id, datetime]
     write_disposition: merge
     partition_by: datetime
     incremental:

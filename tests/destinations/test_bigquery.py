@@ -2147,3 +2147,56 @@ def test_commit_state_serializes_concurrent_calls(
         t.join()
 
     assert not collided.is_set(), "commit_state DML overlapped — conn.lock not held"
+
+
+@pytest.mark.parametrize("partition_type", ["TIMESTAMP", "DATE", "INT64"])
+def test_merge_partition_bounds_are_static_and_key_safe(partition_type: str) -> None:
+    sql = merge_sql(
+        project="my-proj", dataset="d", target_table="events", staging_table="batch",
+        primary_key=("id", "occurred_at"), columns=("id", "occurred_at", "value"),
+        partition_field="occurred_at", partition_type=partition_type,
+    )
+    assert f"DECLARE dtex_partition_min {partition_type};" in sql
+    assert "MIN(`occurred_at`), MAX(`occurred_at`) FROM `my-proj`.`d`.`batch`" in sql
+    assert "T.`occurred_at` = S.`occurred_at`" in sql
+    assert "T.`occurred_at` BETWEEN dtex_partition_min AND dtex_partition_max" in sql
+    assert "WHEN MATCHED THEN UPDATE SET `value` = S.`value`" in sql
+
+
+@pytest.mark.parametrize(
+    "field,kind",
+    [("occurred_at", "TIMESTAMP"), ("id", "STRING"), ("id", "INT64; DROP TABLE x")],
+)
+def test_merge_partition_bounds_reject_unsafe_keys_or_types(field: str, kind: str) -> None:
+    with pytest.raises(ValueError):
+        merge_sql(
+            project="my-proj", dataset="d", target_table="events", staging_table="batch",
+            primary_key=("id",), columns=("id", "occurred_at", "value"),
+            partition_field=field, partition_type=kind,
+        )
+
+
+@pytest.mark.parametrize("in_key", [True, False])
+def test_write_batch_only_prunes_a_partition_in_the_merge_key(
+    bigquery_destination: LoadedConnector,
+    fake_bq: _FakeBigQueryModule,
+    fake_gcs: type[_FakeStorageClient],
+    in_key: bool,
+) -> None:
+    conn = _open_with_fakes(bigquery_destination)
+    hooks = _hooks(bigquery_destination)
+    meta = StreamMeta(
+        table="events", write_disposition=WriteDisposition.MERGE,
+        primary_key=("id", "occurred_at") if in_key else ("id",),
+        schema=Schema(fields=(Field(name="id", type=FieldType.INTEGER),
+                              Field(name="occurred_at", type=FieldType.TIMESTAMP),
+                              Field(name="name", type=FieldType.STRING))),
+        partition=PartitionConfig(field="occurred_at", type=PartitionType.TIME,
+                                  granularity=TimeGranularity.DAY),
+    )
+    hooks["ensure_schema"](conn, meta)
+    batch = [{"id": 1, "occurred_at": datetime(2026, 9, 11, 12, tzinfo=UTC), "name": "a"}]
+    hooks["write_batch"](conn, batch, meta)
+    sql = conn.client.bq.queries[-1]["sql"]
+    assert ("dtex_partition_min" in sql) == in_key
+    assert conn.client.bq.deleted_tables

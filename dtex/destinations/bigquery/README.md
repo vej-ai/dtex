@@ -160,3 +160,13 @@ For the cursor-based auto-default policy (`timestamp` / `date` →
   ([docs/09 §4](../../../docs/09-logging-and-observability.md))
 
 Both prefixed `_det_` so they sort away from user tables.
+
+
+### Partition pruning for merges
+
+When the partition field belongs to the merge primary key, BigQuery merges
+calculate that batch's bounds from staging and restrict the target scan to
+those partitions. Non-key partition fields keep the unrestricted merge:
+filtering them could duplicate an existing row when its partition value changes.
+Klaviyo event timestamps are immutable, so its event key includes `id` and
+`datetime`. Profile updates remain keyed by ID and are not pruned this way.

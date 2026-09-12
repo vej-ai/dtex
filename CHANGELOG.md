@@ -10,6 +10,19 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.14.3] — 2026-09-12
+
+- Fix full-table BigQuery scans for merges whose partition column belongs to
+  the primary key. Static bounds come from each staging batch; mutable
+  non-key partitions retain the unrestricted merge to avoid duplicate rows.
+- Use Klaviyo events' immutable `(id, datetime)` merge key to enable date
+  pruning. A live 2,000-row replay on a 72.8-million-event clone processed
+  56.3 MB instead of an estimated 188.8 GB, updating all rows without duplicates.
+- Preserve declared raw attributes/relationships on campaigns and campaign/flow
+  messages, including fields not individually promoted.
+- Add regression cases covering supported partition types, unsafe keys,
+  type validation, and the destination write path.
+
 ## [0.14.2] — 2026-09-11
 
 ### Fixed
@@ -1282,7 +1295,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.3...HEAD
+[0.14.3]: https://github.com/vej-ai/dtex/releases/tag/v0.14.3
 [0.14.2]: https://github.com/vej-ai/dtex/releases/tag/v0.14.2
 [0.14.1]: https://github.com/vej-ai/dtex/releases/tag/v0.14.1
 [0.14.0]: https://github.com/vej-ai/dtex/releases/tag/v0.14.0

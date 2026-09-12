@@ -88,7 +88,7 @@ from dtex.destinations.bigquery.ddl import (
     merge_sql,
     validate_identifier,
 )
-from dtex.types import Field, FieldMode, FieldType
+from dtex.types import Field, FieldMode, FieldType, PartitionConfig, PartitionType
 
 
 # # NOTE: ``PartitionDriftError`` is intentionally a destination-local
@@ -547,7 +547,9 @@ def write_batch(conn: BQConn, batch: Batch, stream: StreamMeta) -> int:
                 f"write_batch: disposition 'merge' for table {table_name!r} "
                 f"requires a primary_key (docs/05 §4)"
             )
-        _merge_via_staging(conn, table_name, stamped, schema, stream.primary_key)
+        _merge_via_staging(
+            conn, table_name, stamped, schema, stream.primary_key, stream.partition
+        )
     else:  # pragma: no cover — WriteDisposition is a closed 3-member enum.
         raise ValueError(f"write_batch: unknown disposition {wd!r}")
 
@@ -896,6 +898,7 @@ def _merge_via_staging(
     batch: list[dict[str, Any]],
     schema: Schema,
     primary_key: tuple[str, ...],
+    partition: PartitionConfig | None = None,
 ) -> None:
     """LOAD a Parquet batch into a per-batch staging table, then MERGE into target.
 
@@ -954,6 +957,19 @@ def _merge_via_staging(
 
     try:
         columns = tuple(f.name for f in schema.fields)
+        partition_field = None
+        partition_type = None
+        if (
+            partition is not None
+            and partition.type in {PartitionType.TIME, PartitionType.RANGE}
+            and partition.field in primary_key
+        ):
+            field = next((f for f in schema.fields if f.name == partition.field), None)
+            if field is not None and field.type in {
+                FieldType.TIMESTAMP, FieldType.DATE, FieldType.INTEGER
+            }:
+                partition_field = field.name
+                partition_type = bigquery_type(field.type)
         sql = merge_sql(
             project=client.project,
             dataset=client.dataset,
@@ -961,6 +977,8 @@ def _merge_via_staging(
             staging_table=staging_name,
             primary_key=primary_key,
             columns=columns,
+            partition_field=partition_field,
+            partition_type=partition_type,
         )
 
         def _run() -> Any:

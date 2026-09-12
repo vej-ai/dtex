@@ -678,6 +678,8 @@ def _campaign_records(
                             "send_options": attrs.get("send_options"),
                             "send_strategy": attrs.get("send_strategy"),
                             "tracking_options": attrs.get("tracking_options"),
+                            "attributes": attrs,
+                            "relationships": item.get("relationships") or {},
                         }
                     )
                 # Map each included message back to its owning campaign.
@@ -707,6 +709,8 @@ def _campaign_records(
                             "from_label": content.get("from_label"),
                             "send_times": attrs.get("send_times"),
                             "definition": definition,
+                            "attributes": attrs,
+                            "relationships": item.get("relationships") or {},
                         }
                     )
     return campaigns, messages
@@ -816,6 +820,8 @@ def flow_messages(stream_def: StreamDef, config: Config, log: logging.Logger) ->
                             "created": attrs.get("created"),
                             "updated": attrs.get("updated"),
                             "definition": definition,
+                            "attributes": attrs,
+                            "relationships": message.get("relationships") or {},
                         }
                     )
     log.info("klaviyo.flow_messages: %d message(s) from %d flow(s)", len(out), walked)

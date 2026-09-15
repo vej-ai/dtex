@@ -65,13 +65,18 @@ from .records import (
     to_record,
 )
 
-# Fields requested by the hourly stream — campaign grain only; the ad-level
-# breakdown arrays (video, unique_*) are not needed for hour-of-day spend.
+# Default fields requested by the hourly stream — campaign grain only; the
+# ad-level breakdown arrays (video, unique_*) are not needed for hour-of-day
+# spend. This is the `hourly_fields` param's default in register.yaml (kept
+# equal by test); a config overrides it to land more per-hour metrics.
 HOURLY_FIELDS = (
     "account_id,account_name,account_currency,campaign_id,campaign_name,"
     "date_start,spend,impressions,clicks,actions,action_values"
 )
 ACCOUNT_TZ_FIELDS = "timezone_name,timezone_offset_hours_utc"
+# The hourly stream's key fields (hour comes from the breakdown). A requested
+# field list without them would land nothing — every row would be unkeyable.
+HOURLY_KEY_FIELDS = ("account_id", "campaign_id", "date_start")
 
 Projector = Callable[[dict[str, Any], str], dict[str, Any] | None]
 
@@ -87,6 +92,18 @@ def _build_client(config: Config) -> MetaClient:
         poll_interval_seconds=float(config.poll_interval_seconds),
         job_timeout_seconds=float(config.job_timeout_seconds),
     )
+
+
+def hourly_fields(value: Any) -> str:
+    """Normalise the `hourly_fields` param; fail fast if a key field is missing."""
+    names = [f.strip() for f in str(value or HOURLY_FIELDS).split(",") if f.strip()]
+    missing = [k for k in HOURLY_KEY_FIELDS if k not in names]
+    if missing:
+        raise ValueError(
+            f"meta.insights_hourly: hourly_fields must include {', '.join(missing)} "
+            "(the stream's key); got: " + ",".join(names)
+        )
+    return ",".join(names)
 
 
 def _walk(
@@ -255,6 +272,7 @@ def insights_hourly(config: Config, cursor: Cursor, log: logging.Logger) -> Iter
 
     Merge on (day, hour, account, campaign).
     """
+    fields = hourly_fields(config.hourly_fields)
     client = _build_client(config)
     accounts = parse_accounts(config.account_ids)
     run_ts = datetime.now(tz=UTC)
@@ -293,7 +311,7 @@ def insights_hourly(config: Config, cursor: Cursor, log: logging.Logger) -> Iter
         log=log,
         client=client,
         accounts=accounts,
-        fields=HOURLY_FIELDS,
+        fields=fields,
         level="campaign",
         breakdowns=HOURLY_BREAKDOWN,
         project=project,

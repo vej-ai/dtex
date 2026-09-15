@@ -58,7 +58,7 @@ from dtex.sources.meta.records import (
     to_hourly_record,
     to_record,
 )
-from dtex.sources.meta.source import HOURLY_FIELDS, _walk
+from dtex.sources.meta.source import HOURLY_FIELDS, _walk, hourly_fields
 
 # --------------------------------------------------------------------------
 # Stub Graph API server
@@ -661,7 +661,9 @@ def _write_project(tmp_path: Path) -> None:
     )
 
 
-def _write_config(tmp_path: Path, *, base_url: str, streams: str, start_date: str) -> None:
+def _write_config(
+    tmp_path: Path, *, base_url: str, streams: str, start_date: str, extra_params: str = ""
+) -> None:
     (tmp_path / "configs").mkdir(parents=True, exist_ok=True)
     (tmp_path / "configs" / "meta_test.yml").write_text(
         "name: meta_test\n"
@@ -676,6 +678,7 @@ def _write_config(tmp_path: Path, *, base_url: str, streams: str, start_date: st
         "  page_delay_seconds: 0\n"
         "  poll_interval_seconds: 0\n"
         "  job_timeout_seconds: 5\n"
+        f"{extra_params}"
         f"streams:\n{streams}\n"
     )
 
@@ -794,3 +797,64 @@ def test_end_to_end_insights_hourly(
     assert submit.params["breakdowns"] == HOURLY_BREAKDOWN
     assert json.loads(submit.params["time_range"]) == {"since": day, "until": day}
     assert re.fullmatch(r"/v21\.0/act_111/insights", submit.path)
+
+
+def test_hourly_fields_default_matches_register() -> None:
+    """register.yaml's hourly_fields default IS HOURLY_FIELDS — one list, two mirrors."""
+    import yaml
+
+    register = Path(dtex.sources.meta.__file__).parent / "register.yaml"
+    params = yaml.safe_load(register.read_text())["params"]
+    assert params["hourly_fields"]["default"] == HOURLY_FIELDS
+
+
+def test_hourly_fields_normalises_and_requires_key_fields() -> None:
+    assert hourly_fields(None) == HOURLY_FIELDS
+    assert hourly_fields(" account_id, campaign_id ,date_start,,spend ") == (
+        "account_id,campaign_id,date_start,spend"
+    )
+    with pytest.raises(ValueError, match="campaign_id"):
+        hourly_fields("account_id,date_start,spend")
+
+
+def test_end_to_end_insights_hourly_extra_fields(
+    graph_stub: tuple[_Graph, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An hourly_fields override is what gets requested, and an extra
+    action-breakdown field (outbound_clicks) lands via schema evolution."""
+    graph, base_url = graph_stub
+    monkeypatch.setenv("META_ACCESS_TOKEN", "EAAe2e")
+    graph.accounts["111"] = {
+        "id": "act_111",
+        "timezone_name": "Europe/Vilnius",
+        "timezone_offset_hours_utc": 3,
+    }
+    today = datetime.now(tz=UTC).date()
+    day = today.isoformat()
+    row = _hourly_row(day, "13:00:00 - 13:59:59")
+    row["outbound_clicks"] = [{"action_type": "outbound_click", "value": "3"}]
+    graph.pages = [[row]]
+
+    requested = HOURLY_FIELDS + ",outbound_clicks"
+    _write_project(tmp_path)
+    _write_config(
+        tmp_path,
+        base_url=base_url,
+        streams="  insights_hourly:\n",
+        start_date=day,
+        extra_params=f"  hourly_fields: '{requested}'\n",
+    )
+    db_path = str(tmp_path / "warehouse.duckdb")
+    result = dtex.run(
+        config="meta_test", project_dir=str(tmp_path), destination_params_override={"path": db_path}
+    )
+    assert result.status.value == "succeeded", result.error
+
+    submit = next(r for r in graph.captured if r.method == "POST")
+    assert submit.params["fields"] == requested
+
+    conn = duckdb.connect(db_path)
+    (outbound,) = conn.execute("SELECT outbound_clicks FROM insights_hourly").fetchone()
+    conn.close()
+    parsed = json.loads(outbound) if isinstance(outbound, str) else outbound
+    assert parsed == [{"action_type": "outbound_click", "value": "3"}]

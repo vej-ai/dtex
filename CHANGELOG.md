@@ -10,6 +10,14 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+### Added
+
+- Meta connector: `hourly_fields` param for the `insights_hourly` stream,
+  so a config can request more campaign-level metrics per hour (e.g.
+  `outbound_clicks`) without a code change. Defaults to the previous fixed
+  list, so existing configs are unchanged; the run fails fast if the list
+  drops a key field (`account_id`, `campaign_id`, `date_start`).
+
 ## [0.14.4] — 2026-09-12
 
 - Fix promoted-column type drift with additive `streams.<name>.schema`

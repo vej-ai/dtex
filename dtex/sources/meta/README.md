@@ -45,11 +45,15 @@ downstream, e.g. in BigQuery:
 DATETIME(TIMESTAMP(DATETIME(date_start, TIME(hour, 0, 0)), timezone_name), 'Europe/London')
 ```
 
-Fields: `account_id, account_name, account_currency, campaign_id,
-campaign_name, date_start, spend, impressions, clicks, actions,
-action_values` (fixed in `source.py` `HOURLY_FIELDS`, independent of the
-`fields` param). A row without a parsable hour is unkeyable and dropped
-(counted in the log).
+Fields: the `hourly_fields` param, default `account_id, account_name,
+account_currency, campaign_id, campaign_name, date_start, spend,
+impressions, clicks, actions, action_values` (independent of the
+`fields` param). Append to it to land more per-hour metrics — e.g.
+`outbound_clicks`, which arrives as a JSON `[{action_type, value}]` array
+via schema evolution. `account_id`, `campaign_id` and `date_start` are
+required (the run fails fast without them); a field Meta refuses with the
+hourly breakdown fails the run with the API's message. A row without a
+parsable hour is unkeyable and dropped (counted in the log).
 
 Campaign × hour is ~100× smaller per day than ad-level daily, so a wider
 `window_days` and a later `start_date` for this stream only are a good

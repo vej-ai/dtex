@@ -73,7 +73,13 @@ The v2 API has no change feed, and everything else follows from that.
 ## Streams
 
 They hand off through the landed tables, so run them from **one config, in
-this order** (`streams: all` does).
+this order** (`streams: all` does), and **sequentially**: the engine's default
+`threads: 1`. With `--threads N` (or `threads:` in `profiles.yml`) the streams
+start together and each reads what the *previous* run landed. Nothing is lost
+that way (the watermarks refuse to advance past a stale snapshot), but every
+hand-off slips by one run: a purchase lands two or three runs late instead of
+in the run that found it, and the sweep backlog grows. If a shared build
+passes `--threads` for other pipelines, pass `--threads 1` for this one.
 
 | Stream | What it lands | Needs `landed_reader` |
 |---|---|---|

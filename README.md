@@ -69,6 +69,7 @@ auth checklist, scope requirements, schema, and known limitations.
 | [`singular`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/singular/README.md) | Singular.net Reporting API — daily network + agency-tagged attribution reports |
 | [`intercom`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/intercom/README.md) | Intercom REST API — contacts, conversations + transcript parts, tickets, companies, articles, workspace dimensions; Airbyte-compatible column shapes |
 | [`meta`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/meta/README.md) | Meta (Facebook / Instagram) Ads — ad-level daily + campaign-level hourly insights via async report jobs. Created by [Auste Luksaite](https://www.linkedin.com/in/austeluksaite/) |
+| [`konnektive`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/konnektive/README.md) | Konnektive (Checkout Champ) CRM — orders, transactions, purchases, customers + daily summary; incremental on `dateUpdated`, resumable backfill |
 
 **Destinations:**
 

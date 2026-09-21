@@ -1,0 +1,503 @@
+# Konnektive CRM — baked source connector for the Konnektive (Checkout
+# Champ) CRM API (https://api.konnektive.com). Five streams:
+#
+# * `orders`        — order/query/        merge on orderId
+# * `transactions`  — transactions/query/ merge on transactionId
+# * `purchases`     — purchase/query/     merge on purchaseId  (subscriptions)
+# * `customers`     — customer/query/     merge on customerId
+# * `summary`       — transactions/summary/ (reportType=date), merge on date
+#
+# The four query streams are incremental on `dateUpdated`: every run asks
+# for rows UPDATED since the cursor (minus `lookback_hours`), in
+# `window_days`-wide windows, 200 rows a page, and merges on the object's
+# id. A refund, a chargeback flag or a rebill therefore re-lands the row —
+# the table is current state, not an event log.
+#
+# DATE-TIMES ARE ACCOUNT-LOCAL. Konnektive returns wall-clock values in the
+# account's timezone with no offset ("2026-09-18 13:31:23"). They land as
+# STRING, untouched; convert downstream with the account's zone. Typing
+# them TIMESTAMP here would stamp them UTC and be silently wrong by hours.
+#
+# COLUMNS. Konnektive's response shape is the same for every account, so
+# its documented fields are declared as columns, under the API's own
+# camelCase names. Amounts stay STRING exactly as sent ("29.99") — cast
+# downstream, where the precision choice belongs. The per-account bags
+# (`customFields`, `custom1..5`) and nested arrays (`items`,
+# `fulfillments`, `transactions`, `notes`, `paySources`) land as JSON. And
+# every row carries `raw`: the entire object as returned, so a field
+# Konnektive adds later is already landed before any connector release.
+# One rename: a key that starts with a digit (`3DTxnResult`) gains a `_`
+# prefix as a column, because warehouses reject it; `raw` keeps it as-is.
+#
+# Auth: a login id + password sent as request parameters on every call
+# (Konnektive has no header scheme). The connector POSTs them in the form
+# body by default so neither ever appears in a URL. Create a dedicated API
+# user in the CRM (Admin → Users → API) and allow-list the runner's IP if
+# the account enforces one.
+
+name: konnektive
+kind: source
+version: "0.1.0"
+summary: Konnektive CRM — orders, transactions, purchases, customers, daily summary.
+tags: [konnektive, checkoutchamp, crm, ecommerce, orders, subscriptions, payments]
+
+requires:
+  - "requests>=2.31"
+
+params:
+  start_date:
+    type: string
+    required: true
+    description: >-
+      First `dateUpdated` (YYYY-MM-DD, account-local) pulled when there is
+      no cursor yet — virgin state, `dtex state reset`, or --full-refresh.
+      Deliberately a required param, not an incremental.initial_value: the
+      honest floor is when THIS account opened, and a too-early default
+      costs one request per empty day per stream.
+  account_timezone:
+    type: string
+    default: "America/New_York"
+    description: >-
+      IANA zone of the Konnektive account (Admin → Settings). Used only to
+      work out "now" in the account's terms for the end of the last window.
+      Konnektive accounts default to US Eastern. Too far west and the
+      newest rows wait for the next run; too far east is harmless.
+  window_days:
+    type: int
+    default: 1
+    description: >-
+      Width of one request window, in days. Small windows keep page walks
+      shallow (pagination is by page NUMBER, so rows updated mid-walk shift
+      later pages) and make each request individually retryable. Widen for
+      a low-volume account to cut request count on a long backfill.
+  lookback_hours:
+    type: int
+    default: 24
+    description: >-
+      Overlap re-pulled on every incremental run of the four query streams
+      — the start is the cursor minus this. Covers rows that were mid-update
+      during the previous run. Re-pulled rows merge idempotently.
+  summary_lookback_days:
+    type: int
+    default: 35
+    description: >-
+      Trailing days of `summary` re-pulled on every run. Refunds and
+      chargebacks are booked against the original transaction date, so a
+      day's figures keep moving for weeks. One request per day.
+  page_size:
+    type: int
+    default: 200
+    description: Rows per page (`resultsPerPage`). Konnektive caps it at 200.
+  batch_size:
+    type: int
+    default: 1000
+    description: Rows per batch handed to the destination.
+  include_custom_fields:
+    type: bool
+    default: true
+    description: Send includeCustomFields=1 so `customFields` is populated.
+  http_method:
+    type: string
+    default: "POST"
+    description: >-
+      POST sends the credentials in the form body (default — they never
+      touch a URL). GET sends them in the query string; use it only for an
+      account or proxy that rejects POST.
+  base_url:
+    type: string
+    default: "https://api.konnektive.com"
+    description: API base URL. Override for a stub server in tests.
+  timeout_seconds:
+    type: int
+    default: 120
+    description: >-
+      Hard read timeout per request. A hung response fails the run loudly
+      instead of stalling it.
+  max_retries:
+    type: int
+    default: 5
+    description: >-
+      Bounded retries for 429 / 5xx / network errors and for transient
+      `result: ERROR` responses. Auth failures are never retried.
+  min_request_interval_seconds:
+    type: float
+    default: 0.0
+    description: Minimum spacing between requests. 0 = no pacing.
+
+secrets:
+  # The API user's login id and password. Env-var refs work with a plain
+  # `pip install dtex`; profile-level `secret://` overrides (GCP Secret
+  # Manager / AWS / Vault) work for production.
+  - name: login_id
+    ref: ${env.KONNEKTIVE_LOGIN_ID}
+  - name: password
+    ref: ${env.KONNEKTIVE_PASSWORD}
+
+streams:
+  # orders — one row per order; `items` is the line-item array.
+  - name: orders
+    table: orders
+    primary_key: [orderId]
+    write_disposition: merge
+    incremental:
+      cursor_field: dateUpdated
+      cursor_type: string
+      # Windows ascend and the connector observes once per completed
+      # window, so the cursor may be persisted mid-stream: a long backfill
+      # that dies resumes from its last finished window. Lookback is
+      # applied in the connector (`lookback_hours`) — the value is an
+      # account-local wall-clock string, not something the engine can
+      # subtract from. No initial_value ON PURPOSE: `start_date` governs.
+      ordered: true
+    schema:
+      - {name: orderId, type: STRING, mode: REQUIRED}
+      - {name: dateCreated, type: STRING}
+      - {name: dateUpdated, type: STRING, mode: REQUIRED}
+      - {name: actualOrderId, type: INTEGER}
+      - {name: address1, type: STRING}
+      - {name: address2, type: STRING}
+      - {name: affId, type: STRING}
+      - {name: agentName, type: STRING}
+      - {name: agentUserId, type: INTEGER}
+      - {name: avsResponse, type: STRING}
+      - {name: baseShipping, type: STRING}
+      - {name: campaignId, type: INTEGER}
+      - {name: campaignName, type: STRING}
+      - {name: cardExpiryDate, type: STRING}
+      - {name: cardIsDebit, type: INTEGER}
+      - {name: cardIsPrepaid, type: INTEGER}
+      - {name: cardLast4, type: STRING}
+      - {name: cardType, type: STRING}
+      - {name: city, type: STRING}
+      - {name: clientOrderId, type: STRING}
+      - {name: companyName, type: STRING}
+      - {name: country, type: STRING}
+      - {name: currencyCode, type: STRING}
+      - {name: currencySymbol, type: STRING}
+      - {name: custom1, type: STRING}
+      - {name: custom2, type: STRING}
+      - {name: custom3, type: STRING}
+      - {name: custom4, type: STRING}
+      - {name: custom5, type: STRING}
+      - {name: customerId, type: INTEGER}
+      - {name: customFields, type: JSON}
+      - {name: cvvResponse, type: STRING}
+      - {name: discountPrice, type: STRING}
+      - {name: emailAddress, type: STRING}
+      - {name: firstName, type: STRING}
+      - {name: fulfillments, type: JSON}
+      - {name: hasUpsell, type: BOOLEAN}
+      - {name: ipAddress, type: STRING}
+      - {name: isDeclineSave, type: INTEGER}
+      - {name: items, type: JSON}
+      - {name: lastName, type: STRING}
+      - {name: name, type: STRING}
+      - {name: orderStatus, type: STRING}
+      - {name: orderType, type: STRING}
+      - {name: paySource, type: STRING}
+      - {name: phoneNumber, type: STRING}
+      - {name: postalCode, type: STRING}
+      - {name: prepaidType, type: STRING}
+      - {name: price, type: STRING}
+      - {name: productCost, type: STRING}
+      - {name: refundRemaining, type: STRING}
+      - {name: salesTax, type: STRING}
+      - {name: shipAddress1, type: STRING}
+      - {name: shipAddress2, type: STRING}
+      - {name: shipCarrier, type: STRING}
+      - {name: shipCity, type: STRING}
+      - {name: shipCountry, type: STRING}
+      - {name: shipFirstName, type: STRING}
+      - {name: shipLastName, type: STRING}
+      - {name: shipMethod, type: STRING}
+      - {name: shippingCost, type: STRING}
+      - {name: shipPostalCode, type: STRING}
+      - {name: shipState, type: STRING}
+      - {name: shipUpcharge, type: STRING}
+      - {name: sourceId, type: INTEGER}
+      - {name: sourceTitle, type: STRING}
+      - {name: sourceValue1, type: STRING}
+      - {name: sourceValue2, type: STRING}
+      - {name: sourceValue3, type: STRING}
+      - {name: sourceValue4, type: STRING}
+      - {name: sourceValue5, type: STRING}
+      - {name: state, type: STRING}
+      - {name: surcharge, type: STRING}
+      - {name: totalAmount, type: STRING}
+      - {name: totalDiscount, type: STRING}
+      - {name: UTMCampaign, type: STRING}
+      - {name: UTMContent, type: STRING}
+      - {name: UTMMedium, type: STRING}
+      - {name: UTMSource, type: STRING}
+      - {name: UTMTerm, type: STRING}
+      - {name: raw, type: JSON, description: "The entire object as returned by the API."}
+
+  # transactions — sales, rebills, refunds, declines; chargeback fields restate in place.
+  - name: transactions
+    table: transactions
+    primary_key: [transactionId]
+    write_disposition: merge
+    incremental:
+      cursor_field: dateUpdated
+      cursor_type: string
+      # Windows ascend and the connector observes once per completed
+      # window, so the cursor may be persisted mid-stream: a long backfill
+      # that dies resumes from its last finished window. Lookback is
+      # applied in the connector (`lookback_hours`) — the value is an
+      # account-local wall-clock string, not something the engine can
+      # subtract from. No initial_value ON PURPOSE: `start_date` governs.
+      ordered: true
+    schema:
+      - {name: transactionId, type: INTEGER, mode: REQUIRED}
+      - {name: dateCreated, type: STRING}
+      - {name: dateUpdated, type: STRING, mode: REQUIRED}
+      - {name: _3DTxnResult, type: STRING}
+      - {name: actualOrderId, type: INTEGER}
+      - {name: address1, type: STRING}
+      - {name: address2, type: STRING}
+      - {name: affId, type: STRING}
+      - {name: arn, type: STRING}
+      - {name: authCode, type: STRING}
+      - {name: avsResponse, type: STRING}
+      - {name: billingCycleNumber, type: INTEGER}
+      - {name: campaignCategoryName, type: STRING}
+      - {name: campaignId, type: STRING}
+      - {name: campaignName, type: STRING}
+      - {name: cardBin, type: STRING}
+      - {name: cardIsDebit, type: INTEGER}
+      - {name: cardIsPrepaid, type: INTEGER}
+      - {name: cardLast4, type: STRING}
+      - {name: cardType, type: STRING}
+      - {name: cascadeId, type: INTEGER}
+      - {name: chargebackAmount, type: STRING}
+      - {name: chargebackDate, type: STRING}
+      - {name: chargebackNote, type: STRING}
+      - {name: chargebackReasonCode, type: STRING}
+      - {name: city, type: STRING}
+      - {name: clientOrderId, type: STRING}
+      - {name: clientTxnId, type: STRING}
+      - {name: country, type: STRING}
+      - {name: currencyCode, type: STRING}
+      - {name: currencySymbol, type: STRING}
+      - {name: custom1, type: STRING}
+      - {name: custom2, type: STRING}
+      - {name: custom3, type: STRING}
+      - {name: custom4, type: STRING}
+      - {name: custom5, type: STRING}
+      - {name: customerId, type: INTEGER}
+      - {name: customFields, type: JSON}
+      - {name: cvvResponse, type: STRING}
+      - {name: emailAddress, type: STRING}
+      - {name: firstName, type: STRING}
+      - {name: ipAddress, type: STRING}
+      - {name: isChargedback, type: INTEGER}
+      - {name: items, type: JSON}
+      - {name: lastName, type: STRING}
+      - {name: merchant, type: STRING}
+      - {name: merchantDescriptor, type: STRING}
+      - {name: merchantId, type: INTEGER}
+      - {name: merchantTxnId, type: STRING}
+      - {name: midNumber, type: STRING}
+      - {name: orderAgentName, type: STRING}
+      - {name: orderId, type: STRING}
+      - {name: orderType, type: STRING}
+      - {name: parentTxnId, type: INTEGER}
+      - {name: paySource, type: STRING}
+      - {name: paySourceId, type: STRING}
+      - {name: phoneNumber, type: STRING}
+      - {name: postalCode, type: STRING}
+      - {name: prepaidType, type: STRING}
+      - {name: recycleNumber, type: INTEGER}
+      - {name: refundItemId, type: INTEGER}
+      - {name: refundProductName, type: STRING}
+      - {name: refundReason, type: STRING}
+      - {name: responseText, type: STRING}
+      - {name: responseType, type: STRING}
+      - {name: sourceTitle, type: STRING}
+      - {name: sourceValue1, type: STRING}
+      - {name: sourceValue2, type: STRING}
+      - {name: sourceValue3, type: STRING}
+      - {name: sourceValue4, type: STRING}
+      - {name: sourceValue5, type: STRING}
+      - {name: state, type: STRING}
+      - {name: surcharge, type: STRING}
+      - {name: totalAmount, type: STRING}
+      - {name: txnType, type: STRING}
+      - {name: UTMCampaign, type: STRING}
+      - {name: UTMContent, type: STRING}
+      - {name: UTMMedium, type: STRING}
+      - {name: UTMSource, type: STRING}
+      - {name: UTMTerm, type: STRING}
+      - {name: raw, type: JSON, description: "The entire object as returned by the API."}
+
+  # purchases — subscription / recurring-purchase state, with its transaction history nested.
+  - name: purchases
+    table: purchases
+    primary_key: [purchaseId]
+    write_disposition: merge
+    incremental:
+      cursor_field: dateUpdated
+      cursor_type: string
+      # Windows ascend and the connector observes once per completed
+      # window, so the cursor may be persisted mid-stream: a long backfill
+      # that dies resumes from its last finished window. Lookback is
+      # applied in the connector (`lookback_hours`) — the value is an
+      # account-local wall-clock string, not something the engine can
+      # subtract from. No initial_value ON PURPOSE: `start_date` governs.
+      ordered: true
+    schema:
+      - {name: purchaseId, type: STRING, mode: REQUIRED}
+      - {name: dateCreated, type: STRING}
+      - {name: dateUpdated, type: STRING, mode: REQUIRED}
+      - {name: actualProductId, type: INTEGER}
+      - {name: actualPurchaseId, type: INTEGER}
+      - {name: address1, type: STRING}
+      - {name: affId, type: STRING}
+      - {name: billingCycleNumber, type: INTEGER}
+      - {name: billingCycleType, type: STRING}
+      - {name: billingIntervalDays, type: INTEGER}
+      - {name: campaignId, type: INTEGER}
+      - {name: cancellationScheduled, type: INTEGER}
+      - {name: cancelReason, type: STRING}
+      - {name: cardBin, type: STRING}
+      - {name: cardExpiryDate, type: STRING}
+      - {name: cardLast4, type: STRING}
+      - {name: city, type: STRING}
+      - {name: country, type: STRING}
+      - {name: currencyCode, type: STRING}
+      - {name: currencySymbol, type: STRING}
+      - {name: customerId, type: INTEGER}
+      - {name: descriptor, type: STRING}
+      - {name: displayName, type: STRING}
+      - {name: emailAddress, type: STRING}
+      - {name: finalBillingCycle, type: INTEGER}
+      - {name: firstName, type: STRING}
+      - {name: fulfillmentCycleNumber, type: INTEGER}
+      - {name: fulfillments, type: JSON}
+      - {name: lastCancellationDate, type: STRING}
+      - {name: lastName, type: STRING}
+      - {name: merchant, type: STRING}
+      - {name: merchantId, type: STRING}
+      - {name: nextBillDate, type: STRING}
+      - {name: orderId, type: STRING}
+      - {name: pauseScheduled, type: INTEGER}
+      - {name: phoneNumber, type: STRING}
+      - {name: postalCode, type: STRING}
+      - {name: price, type: STRING}
+      - {name: productId, type: INTEGER}
+      - {name: productName, type: STRING}
+      - {name: productQty, type: INTEGER}
+      - {name: productSku, type: STRING}
+      - {name: recycleBillingNumber, type: INTEGER}
+      - {name: shipAddress1, type: STRING}
+      - {name: shipAddress2, type: STRING}
+      - {name: shipCity, type: STRING}
+      - {name: shipCountry, type: STRING}
+      - {name: shipFirstName, type: STRING}
+      - {name: shipLastName, type: STRING}
+      - {name: shippingPrice, type: STRING}
+      - {name: shipPostalCode, type: STRING}
+      - {name: shipState, type: STRING}
+      - {name: state, type: STRING}
+      - {name: status, type: STRING}
+      - {name: totalBilled, type: STRING}
+      - {name: totalRefunded, type: STRING}
+      - {name: transactions, type: JSON}
+      - {name: raw, type: JSON, description: "The entire object as returned by the API."}
+
+  # customers — `notes` and `paySources` are nested arrays.
+  - name: customers
+    table: customers
+    primary_key: [customerId]
+    write_disposition: merge
+    incremental:
+      cursor_field: dateUpdated
+      cursor_type: string
+      # Windows ascend and the connector observes once per completed
+      # window, so the cursor may be persisted mid-stream: a long backfill
+      # that dies resumes from its last finished window. Lookback is
+      # applied in the connector (`lookback_hours`) — the value is an
+      # account-local wall-clock string, not something the engine can
+      # subtract from. No initial_value ON PURPOSE: `start_date` governs.
+      ordered: true
+    schema:
+      - {name: customerId, type: INTEGER, mode: REQUIRED}
+      - {name: dateCreated, type: STRING}
+      - {name: dateUpdated, type: STRING, mode: REQUIRED}
+      - {name: address1, type: STRING}
+      - {name: address2, type: STRING}
+      - {name: billShipSame, type: INTEGER}
+      - {name: campaignName, type: STRING}
+      - {name: campaignType, type: STRING}
+      - {name: cardExpiryDate, type: STRING}
+      - {name: cardLast4, type: STRING}
+      - {name: cardType, type: STRING}
+      - {name: city, type: STRING}
+      - {name: contactOptIn, type: INTEGER}
+      - {name: country, type: STRING}
+      - {name: creditAmount, type: STRING}
+      - {name: customFields, type: JSON}
+      - {name: doNotSellName, type: INTEGER}
+      - {name: emailAddress, type: STRING}
+      - {name: emailOptIn, type: INTEGER}
+      - {name: firstName, type: STRING}
+      - {name: gender, type: STRING}
+      - {name: ipAddress, type: STRING}
+      - {name: isBlacklisted, type: INTEGER}
+      - {name: isTaxExempt, type: INTEGER}
+      - {name: lastName, type: STRING}
+      - {name: mostRecentActivity, type: STRING}
+      - {name: notes, type: JSON}
+      - {name: paySource, type: STRING}
+      - {name: paySourceId, type: INTEGER}
+      - {name: paySources, type: JSON}
+      - {name: phoneNumber, type: STRING}
+      - {name: postalCode, type: STRING}
+      - {name: prepaidType, type: STRING}
+      - {name: shipAddress1, type: STRING}
+      - {name: shipAddress2, type: STRING}
+      - {name: shipCity, type: STRING}
+      - {name: shipCountry, type: STRING}
+      - {name: shipFirstName, type: STRING}
+      - {name: shipLastName, type: STRING}
+      - {name: shipPostalCode, type: STRING}
+      - {name: shipState, type: STRING}
+      - {name: state, type: STRING}
+      - {name: raw, type: JSON, description: "The entire object as returned by the API."}
+
+  # summary — Konnektive's own per-day transaction report. Amounts and
+  # percentages are strings as sent; counts are integers.
+  - name: summary
+    table: summary
+    primary_key: [date]
+    write_disposition: merge
+    incremental:
+      cursor_field: date
+      cursor_type: date
+      # Records how far the day-walk got. The trailing re-pull is applied
+      # in the connector (`summary_lookback_days`).
+    schema:
+      - {name: date, type: DATE, mode: REQUIRED}
+      - {name: approvedPerc, type: STRING}
+      - {name: chargebackCnt, type: INTEGER}
+      - {name: chargebackPerc, type: STRING}
+      - {name: chargebackRev, type: STRING}
+      - {name: currencySymbol, type: STRING}
+      - {name: declinesCnt, type: INTEGER}
+      - {name: expenseDetails, type: JSON}
+      - {name: expenses, type: STRING}
+      - {name: grossRevenue, type: STRING}
+      - {name: netRevenue, type: STRING}
+      - {name: newSaleCnt, type: INTEGER}
+      - {name: newSaleRev, type: STRING}
+      - {name: rebillApprovedPerc, type: STRING}
+      - {name: rebillCnt, type: INTEGER}
+      - {name: rebillDeclinesCnt, type: INTEGER}
+      - {name: rebillRev, type: STRING}
+      - {name: refundCnt, type: INTEGER}
+      - {name: refundPerc, type: STRING}
+      - {name: refundRev, type: STRING}
+      - {name: salesTax, type: STRING}
+      - {name: surcharge, type: STRING}
+      - {name: totalDeclinePerc, type: STRING}
+      - {name: raw, type: JSON, description: "The entire object as returned by the API."}

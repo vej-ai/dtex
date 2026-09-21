@@ -100,12 +100,26 @@ params:
     default: "account_id,account_name,account_currency,campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,objective,optimization_goal,date_start,date_stop,impressions,reach,frequency,clicks,unique_clicks,spend,social_spend,full_view_impressions,actions,action_values,unique_actions,conversions,conversion_values,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p95_watched_actions,video_p100_watched_actions,video_time_watched_actions"
     description: >-
       Comma-separated Insights `fields` requested per call by the
-      ads_insights stream. (insights_hourly requests its own fixed campaign-
-      level field list, see source.py HOURLY_FIELDS.) A field Meta
+      ads_insights stream. (insights_hourly requests its own campaign-level
+      list, the `hourly_fields` param.) A field Meta
       rejects (removed in a newer api_version) fails the run with the
       API's own message; drop it here, no code change needed. Fields not
       declared in the stream schema still land via schema evolution
       (scalars as STRING, arrays as JSON).
+  hourly_fields:
+    type: string
+    default: "account_id,account_name,account_currency,campaign_id,campaign_name,date_start,spend,impressions,clicks,actions,action_values"
+    description: >-
+      Comma-separated Insights `fields` requested per call by the
+      insights_hourly stream (level=campaign, hourly breakdown). The default
+      equals source.py HOURLY_FIELDS. Override it to land more campaign-level
+      metrics per hour — e.g. append `outbound_clicks` — without a code
+      change; fields not declared in the stream schema land via schema
+      evolution (scalars as STRING, arrays as JSON), exactly like `fields`.
+      account_id, campaign_id and date_start must stay in the list: they are
+      the stream's key, and the run fails fast without them. Meta rejects
+      some fields together with the hourly breakdown (e.g. `reach`); the run
+      fails with the API's own message and the field is dropped here.
   action_attribution_windows:
     type: string
     default: ""

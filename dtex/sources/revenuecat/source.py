@@ -484,6 +484,13 @@ def subscriptions(config: Config, state: State, log: logging.Logger) -> Iterator
     n_subs = n_new = n_changed = n_unknown = 0
     found_in: dict[str, int] = {}
     for i, (cid, subs) in enumerate(client.map_concurrent(plan.ordered, fetch), start=1):
+        if i % 1000 == 0:
+            log.info(
+                "revenuecat.subscriptions: %d/%d customers, %d subscriptions",
+                i,
+                len(plan.ordered),
+                n_subs,
+            )
         if subs is None:
             n_unknown += 1
         if not subs:
@@ -505,13 +512,6 @@ def subscriptions(config: Config, state: State, log: logging.Logger) -> Iterator
             if len(batch) >= int(config.batch_size):
                 yield batch
                 batch = []
-        if i % 1000 == 0:
-            log.info(
-                "revenuecat.subscriptions: %d/%d customers, %d subscriptions",
-                i,
-                len(plan.ordered),
-                n_subs,
-            )
     if batch:
         yield batch
 

@@ -10,6 +10,22 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.16.1] — 2026-09-21
+
+### Fixed
+
+- **DuckDB: a stream that runs longer than a minute no longer fails.** The
+  DuckDB destination loads each stream inside one transaction, and the engine
+  refreshes the run's stream leases between batches once 60 seconds have
+  passed. That refresh opened a transaction of its own; DuckDB has no nested
+  transactions, so the second `BEGIN` raised (logged as `failed to refresh
+  leases`) and — the damaging part — marked the stream's transaction aborted.
+  The next batch then died with `TransactionContext Error: Current
+  transaction is aborted (please ROLLBACK)` and the stream rolled back. The
+  lease refresh now joins the open stream transaction. BigQuery was never
+  affected; nor were DuckDB streams that finished inside the first minute,
+  which is why local smoke runs hid it.
+
 ## [0.16.0] — 2026-09-21
 
 ### Added
@@ -1350,7 +1366,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/vej-ai/dtex/releases/tag/v0.16.1
 [0.16.0]: https://github.com/vej-ai/dtex/releases/tag/v0.16.0
 [0.15.0]: https://github.com/vej-ai/dtex/releases/tag/v0.15.0
 [0.14.4]: https://github.com/vej-ai/dtex/releases/tag/v0.14.4

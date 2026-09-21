@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +156,167 @@ def list_state(
         return list(records)
     finally:
         dest.hooks["close"](dest.conn)
+
+
+@dataclass(frozen=True)
+class StalenessReport:
+    """One stream's cursor age measured against its declared ``max_staleness``.
+
+    ``limit`` / ``age`` are ``None`` when the stream declares no
+    ``max_staleness`` or has no committed cursor: those are NOT verdicts, so
+    :attr:`stale` is False and the caller should report them as unchecked
+    rather than healthy. Conflating "no opinion" with "fine" is how a
+    monitoring gate goes quiet without anyone noticing.
+    """
+
+    stream: str
+    cursor_value: Any
+    age: timedelta | None
+    limit: timedelta | None
+    stale: bool
+    reason: str
+
+
+def _cursor_age(value: Any, now: datetime) -> timedelta | None:
+    """Wall-clock age of a stored cursor value, or ``None`` if not a time.
+
+    State values round-trip through a JSON column, so a timestamp arrives as
+    an ISO string (and a caller may hand back a value that was JSON-encoded
+    twice — the quotes are stripped rather than trusted). An int cursor is
+    NOT treated as a Unix timestamp: an int cursor is just as often an opaque
+    sequence, and guessing wrong would invent an age. Such streams report as
+    unchecked instead.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, date):
+        moment = datetime.combine(value, time.min)
+    elif isinstance(value, str):
+        text = value.strip().strip('"').strip()
+        if not text:
+            return None
+        candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            moment = datetime.fromisoformat(candidate)
+        except ValueError:
+            try:
+                moment = datetime.combine(date.fromisoformat(text), time.min)
+            except ValueError:
+                return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return now - moment
+
+
+def check_staleness(
+    config_name: str,
+    *,
+    project_dir: str | Path | None = None,
+    target: str | None = None,
+    destination_params: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
+) -> list[StalenessReport]:
+    """Measure each stream's cursor age against its ``max_staleness``.
+
+    The declarative half of the "is this pipeline silently stuck?" question
+    (docs/03 §2.2). A green run says the extraction *worked*; it says nothing
+    about whether the data MOVED. This compares every committed cursor to the
+    grain its own stream declared, so a monthly report and a half-hourly
+    stream in one config are each judged on their own terms.
+
+    Streams with no ``max_staleness``, no committed cursor, or a cursor that
+    is not a point in time are returned with ``stale=False`` and a reason —
+    unchecked, not healthy. One report per declared incremental stream,
+    ordered by name.
+    """
+    _, dest = _resolve_destination(
+        config_name,
+        project_dir=project_dir,
+        target=target,
+        destination_params=destination_params,
+    )
+    try:
+        records = {
+            record.stream: record
+            for record in dest.hooks["read_state"](dest.conn, dest.source_name)
+        }
+    finally:
+        dest.hooks["close"](dest.conn)
+
+    moment = now or datetime.now(tz=UTC)
+    reports: list[StalenessReport] = []
+    for name in sorted(dest.stream_defs):
+        incremental = getattr(dest.stream_defs[name], "incremental", None)
+        if incremental is None:
+            continue
+        limit = incremental.max_staleness_delta()
+        record = records.get(name)
+        value = None if record is None else record.cursor_value
+        if limit is None:
+            reason = "no max_staleness declared"
+        elif record is None:
+            reason = "no committed state"
+        else:
+            age = _cursor_age(value, moment)
+            if age is None:
+                reason = "cursor is not a point in time"
+            else:
+                stale = age > limit
+                # State the overage explicitly. Both figures are rounded for
+                # readability, so a cursor just past its limit would otherwise
+                # render as "2d old, limit 2d" — a STALE verdict that reads
+                # like a passing one.
+                reason = f"cursor is {_humanize(age)} old, limit {_humanize(limit)}"
+                if stale:
+                    reason += f" — over by {_humanize(age - limit)}"
+                reports.append(
+                    StalenessReport(
+                        stream=name,
+                        cursor_value=value,
+                        age=age,
+                        limit=limit,
+                        stale=stale,
+                        reason=reason,
+                    )
+                )
+                continue
+        reports.append(
+            StalenessReport(
+                stream=name,
+                cursor_value=value,
+                age=None,
+                limit=limit,
+                stale=False,
+                reason=reason,
+            )
+        )
+    return reports
+
+
+def _humanize(delta: timedelta) -> str:
+    """A compact, operator-readable duration (``"3d 4h"``, ``"45m"``).
+
+    Rounds down to the minute, so anything under a minute renders as
+    ``"<1m"`` rather than ``"0m"`` — a cursor a few seconds past its limit
+    is still past it, and "over by 0m" would read as a rounding artefact.
+    """
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "in the future"
+    if seconds < 60:
+        return "<1m"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
 
 
 def reset_state(

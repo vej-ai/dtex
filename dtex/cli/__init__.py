@@ -68,7 +68,13 @@ from dtex.cli._scaffold import (
     scaffold_source,
 )
 from dtex.cli._secrets import check_project as _check_secrets_project
-from dtex.cli._state import StateError, list_state, reset_state, set_state
+from dtex.cli._state import (
+    StateError,
+    check_staleness,
+    list_state,
+    reset_state,
+    set_state,
+)
 from dtex.engine import ConfigError, DiscoveryError, EngineError
 from dtex.engine import config as cfg
 from dtex.engine import discovery as disc
@@ -805,11 +811,22 @@ def state() -> None:
     metavar="KEY=VALUE",
     help="Override a destination config value. Repeatable.",
 )
+@click.option(
+    "--stale",
+    "stale",
+    is_flag=True,
+    default=False,
+    help="Check each stream's cursor age against its declared "
+    "`incremental.max_staleness` instead of listing raw state. Exits 1 if "
+    "any stream has exceeded its limit — usable as a scheduled freshness "
+    "gate. Streams that declare no max_staleness are reported as unchecked.",
+)
 def state_list(
     config: str,
     target: str | None,
     project_dir: Path | None,
     destination_params: tuple[str, ...],
+    stale: bool,
 ) -> None:
     """Show the ``_dtex_state`` rows for one config's source.
 
@@ -818,8 +835,16 @@ def state_list(
     has committed incremental state. State rows are keyed by source name
     (not config name) — a re-run under a different config that shares this
     source resumes off the same rows.
+
+    With ``--stale``, reports each stream's cursor age against its declared
+    ``incremental.max_staleness`` and exits 1 if any stream is over its
+    limit — the freshness half of "did this pipeline actually move data?",
+    which a zero exit code from ``dtex run`` cannot answer.
     """
     dest_params = _parse_kv("destination-param", destination_params)
+    if stale:
+        _state_staleness(config, target, project_dir, dest_params)
+        return
     try:
         records = list_state(
             config,
@@ -851,6 +876,51 @@ def state_list(
             ["SOURCE", "STREAM", "CURSOR VALUE", "ROWS TOTAL", "UPDATED AT"], rows
         )
     )
+
+
+def _state_staleness(
+    config: str,
+    target: str | None,
+    project_dir: Path | None,
+    dest_params: dict[str, Any],
+) -> None:
+    """Render ``state list --stale`` and exit non-zero if anything is stale.
+
+    Split out of :func:`state_list` so the listing path stays a plain
+    reader with no exit-code behaviour.
+    """
+    try:
+        reports = check_staleness(
+            config,
+            project_dir=project_dir,
+            target=target,
+            destination_params=dest_params or None,
+        )
+    except _FRIENDLY_ERRORS as exc:
+        _fail(str(exc), code=2)
+        return  # unreachable.
+
+    if not reports:
+        click.echo(f"config {config!r} declares no incremental streams")
+        return
+
+    rows = [
+        [
+            "STALE" if r.stale else ("-" if r.limit is None else "ok"),
+            r.stream,
+            "-" if r.cursor_value is None else str(r.cursor_value),
+            r.reason,
+        ]
+        for r in reports
+    ]
+    click.echo(render_table(["", "STREAM", "CURSOR VALUE", "FRESHNESS"], rows))
+
+    stale = [r.stream for r in reports if r.stale]
+    unchecked = sum(1 for r in reports if r.limit is None)
+    if unchecked:
+        click.echo(f"\n{unchecked} stream(s) declare no max_staleness and were not checked.")
+    if stale:
+        _fail(f"stale stream(s): {', '.join(stale)}")
 
 
 @state.command(name="reset")

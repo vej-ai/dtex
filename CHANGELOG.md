@@ -10,6 +10,57 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-21
+
+### Changed
+
+- **Baked `revenuecat` source 2.0: period-grain transactions, and a fetch
+  plan that cannot lose a purchase.** RevenueCat v2 has no change feed: the
+  customers list carries no purchase signal, subscriptions exist only per
+  customer and transactions only per subscription. 1.x answered that by
+  fanning out over every customer on every run (hours on a real project) and
+  landed no transactions at all. 2.0 adds `products`,
+  `entitlement_products`, `customer_details`, `subscription_transactions`
+  (one row per store transaction, USD and local amounts, the first-seen gross
+  that survives a refund, `refund_detected_at`) and `reconciliation_daily`,
+  and rebuilds `subscriptions` around `targets.py`:
+  - Customers without a live subscription are re-checked on a fixed, decaying
+    schedule after RevenueCat last saw them (hourly at first, thinning out to
+    30 days). The schedule is a pure function of the customer's timestamps and
+    the only memory is a watermark that advances over work that actually
+    finished, so a failed run, an outage or a capped backlog widens the next
+    window instead of dropping anyone.
+  - There is no "this customer has no subscriptions, skip them" memory. A
+    project-local predecessor of this connector had one and silently dropped
+    about 13% of new subscriptions: `last_seen_at` does not reliably move when
+    a customer buys (20 of 2,104 first purchases came more than an hour after
+    the final sighting, the longest 20 hours later), so a customer seen,
+    fetched empty and then buying was never fetched again.
+  - Recently active subscribers are refreshed every run, long-expired ones on
+    a slow rotation; optional operator SQL can name probable changes (a fast
+    path) or known purchasers (bootstrap and safety net).
+  - `reconciliation_daily` compares landed transactions per UTC day with
+    RevenueCat's own chart count. A recent short day makes `subscriptions`
+    re-check every plausible customer around it; an older one is what a
+    warehouse test should alert on.
+  - The customers walk runs as 33 concurrent cursor chains (minutes instead of
+    over an hour for 250k customers) and is gap-free under any list order: it
+    never compares ids, each chain stops where the next one started.
+  - The diff streams read their previous snapshot back from the destination
+    (`landed_reader: bigquery | duckdb`, `landed_dataset`); the other streams
+    run without it.
+  Upgrading from 1.x: see the connector README. `subscriptions` gains columns
+  and loses `customer_last_seen_at`.
+
+### Fixed
+
+- **`revenuecat.metrics_daily` no longer freezes a day at its first reading.**
+  Each run started at the last complete day, so `metrics_lookback_days` never
+  took effect and values RevenueCat revised later (refunds, late store
+  notifications) were never re-pulled. Every run now re-pulls the trailing
+  window; a first run backfills from `metrics_initial_since_date` in 90-day
+  requests.
+
 ## [0.16.1] — 2026-09-21
 
 ### Fixed
@@ -1366,7 +1417,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/vej-ai/dtex/releases/tag/v0.17.0
 [0.16.1]: https://github.com/vej-ai/dtex/releases/tag/v0.16.1
 [0.16.0]: https://github.com/vej-ai/dtex/releases/tag/v0.16.0
 [0.15.0]: https://github.com/vej-ai/dtex/releases/tag/v0.15.0

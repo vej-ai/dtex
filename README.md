@@ -63,7 +63,7 @@ auth checklist, scope requirements, schema, and known limitations.
 | [`postgres`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/postgres/README.md) | Keyset pagination, no `OFFSET` |
 | [`shiphero`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/shiphero/README.md) | GraphQL |
 | [`stripe`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/stripe/README.md) | REST resource-as-stream + opt-in Sigma SQL-as-stream |
-| [`revenuecat`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/revenuecat/README.md) | v2 API — customers + subscriptions + daily chart metrics |
+| [`revenuecat`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/revenuecat/README.md) | v2 API — period-grain subscription transactions, subscriptions, customers, products, daily chart metrics, with a built-in completeness check |
 | [`chargebacks911`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/chargebacks911/README.md) | CBAPIv2 — prevention alerts + chargeback cases, incremental |
 | [`gads`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/gads/README.md) | Google Ads — GAQL query-as-stream + MCC account auto-discovery |
 | [`singular`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/singular/README.md) | Singular.net Reporting API — daily network + agency-tagged attribution reports |

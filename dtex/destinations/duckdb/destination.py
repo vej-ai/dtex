@@ -114,7 +114,13 @@ class DuckConn:
       so a ``replace`` stream truncates exactly once however many batches it
       yields;
     * :attr:`state_table_ready` — whether ``_dtex_state`` has been created
-      this run, so it is created lazily at most once.
+      this run, so it is created lazily at most once;
+    * :attr:`in_transaction` — whether the per-stream ``transaction`` context
+      is open on this connection right now. DuckDB has no nested
+      transactions and its Python API does not report whether one is open,
+      so the hooks that manage their own ``BEGIN`` (the lease refresh fires
+      BETWEEN a stream's batches) ask this flag instead of finding out by
+      having ``BEGIN`` fail — a failure that aborts the OUTER transaction.
     """
 
     conn: duckdb.DuckDBPyConnection
@@ -123,6 +129,7 @@ class DuckConn:
     state_table_ready: bool = False
     runs_table_ready: bool = False
     lease_table_ready: bool = False
+    in_transaction: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -219,6 +226,7 @@ def transaction(conn: DuckConn, stream: StreamMeta) -> Iterator[None]:
     stream that already committed keeps its progress.
     """
     conn.conn.execute("BEGIN TRANSACTION")
+    conn.in_transaction = True
     try:
         yield
     except BaseException:
@@ -226,12 +234,14 @@ def transaction(conn: DuckConn, stream: StreamMeta) -> Iterator[None]:
         # RunInterrupted) unwinding the stream must ROLLBACK too — otherwise
         # the transaction stays open on this connection and the engine's
         # lease release (its own BEGIN) fails, leaving the lease live.
+        conn.in_transaction = False
         conn.conn.execute("ROLLBACK")
         # A rolled-back ``replace`` truncation never happened — clear the
         # per-run guard so a retry within the same run truncates again.
         conn.replace_truncated.discard(stream.table)
         raise
     else:
+        conn.in_transaction = False
         conn.conn.execute("COMMIT")
 
 
@@ -908,14 +918,31 @@ def _update_leases(conn: DuckConn, leases: Sequence[LeaseRecord]) -> None:
     Each row's own ``status`` is written (so heartbeat keeps ``running`` and
     release writes ``done``/``failed``), ``run_id``-guarded so a refresh or
     release never stomps a lease another holder reclaimed. One transaction for
-    the whole set.
+    the whole set — its own, unless a stream's is already open (see below).
+
+    The heartbeat fires BETWEEN a stream's batches, i.e. while the per-stream
+    ``transaction`` is open on this same connection. DuckDB has no nested
+    transactions: a second ``BEGIN`` raises, and that error marks the OUTER
+    transaction aborted — the next ``write_batch`` then dies with "Current
+    transaction is aborted" and the stream is lost. That took down every
+    DuckDB stream that ran past ``LEASE_HEARTBEAT_INTERVAL_SECONDS``. So when
+    a stream transaction is open the updates simply JOIN it.
+
+    Joining costs nothing here. A beat that only becomes visible at the
+    stream's COMMIT would be useless on a shared warehouse, but DuckDB is
+    single-writer: no other process can open the file while this run holds
+    it, so nobody could have read the beat mid-stream anyway. And if the
+    stream rolls back, the beat rolls back with it — leaving the lease looking
+    OLDER, which after a crash only makes it reclaimable sooner. The terminal
+    ``release_leases`` always runs after the stream transaction has ended, so
+    it takes the ordinary own-transaction path below.
     """
     if not leases:
         return
     _ensure_lease_table(conn)
     table = qualified_table(conn.dataset, _LEASE_TABLE)
-    conn.conn.execute("BEGIN TRANSACTION")
-    try:
+
+    def apply() -> None:
         for lease in leases:
             now = lease.heartbeat_at or datetime.now(UTC)
             conn.conn.execute(
@@ -929,6 +956,13 @@ def _update_leases(conn: DuckConn, leases: Sequence[LeaseRecord]) -> None:
                     lease.run_id,
                 ],
             )
+
+    if conn.in_transaction:
+        apply()
+        return
+    conn.conn.execute("BEGIN TRANSACTION")
+    try:
+        apply()
         conn.conn.execute("COMMIT")
     except BaseException:
         conn.conn.execute("ROLLBACK")

@@ -501,3 +501,93 @@ def test_run_keeps_a_foreign_sigterm_handler(
         assert signal.getsignal(signal.SIGTERM) is mine
     finally:
         signal.signal(signal.SIGTERM, before)
+
+
+# --------------------------------------------------------------------------
+# Heartbeat DURING a stream — the lease refresh meets an open transaction
+# --------------------------------------------------------------------------
+#
+# DuckDB wraps each stream's whole load in one transaction (TRANSACTIONAL_LOAD)
+# and the engine beats the lease between batches once
+# LEASE_HEARTBEAT_INTERVAL_SECONDS have passed — i.e. on any stream that runs
+# longer than a minute. The refresh used to open its OWN ``BEGIN``: DuckDB
+# rejects a nested BEGIN, and that error marks the outer transaction aborted,
+# so the next write died with "Current transaction is aborted (please
+# ROLLBACK)" and the stream was lost. Short test streams never beat
+# mid-stream, which is how it went unseen.
+
+
+def test_heartbeat_inside_a_stream_transaction_does_not_abort_the_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import duckdb
+
+    import dtex
+    from dtex.engine import runner
+
+    _write_interrupt_project(tmp_path)
+    monkeypatch.setenv("DTEX_TEST_INTERRUPT", "")
+    # Every batch is now "more than the interval" after the last beat, so the
+    # heartbeat fires after batch 1 — inside the open stream transaction.
+    monkeypatch.setattr(runner, "LEASE_HEARTBEAT_INTERVAL_SECONDS", 0)
+    db = str(tmp_path / "w.duckdb")
+
+    with caplog.at_level("WARNING"):
+        result = dtex.run(
+            config="p", project_dir=str(tmp_path), destination_params_override={"path": db}
+        )
+
+    assert result.status.value == "succeeded", result.error
+    assert [(s.name, s.status.value, s.rows_loaded) for s in result.streams] == [
+        ("rows", "succeeded", 2)
+    ]
+    assert "failed to refresh leases" not in caplog.text
+
+    conn = duckdb.connect(db)
+    landed = conn.execute("SELECT count(*) FROM rows_table").fetchone()
+    leases = conn.execute(
+        "SELECT stream, status FROM _dtex_leases WHERE connector = 'sigsrc'"
+    ).fetchall()
+    conn.close()
+    assert landed == (2,)
+    assert leases == [("rows", "done")], leases
+
+
+def test_heartbeat_joins_an_open_transaction_and_rolls_back_with_it(
+    duckdb_destination: LoadedConnector, tmp_path: Path
+) -> None:
+    """Hook-level: inside ``transaction`` the refresh must not BEGIN/COMMIT on
+    its own — it rides the stream's transaction, so a failed stream takes the
+    beat down with it and leaves the connection usable for the release."""
+    from dtex.types import Schema, StreamMeta, WriteDisposition
+
+    h = _hooks(duckdb_destination)
+    conn = _conn(duckdb_destination, str(tmp_path / "w.duckdb"))
+    stale = _now() - timedelta(seconds=LEASE_STALE_SECONDS - 5)
+    assert _acquire(h, conn, _lease("message", "r1", beat=stale))
+    meta = StreamMeta(
+        table="message", write_disposition=WriteDisposition.APPEND, schema=Schema()
+    )
+
+    with pytest.raises(RuntimeError, match="stream blew up"), h["transaction"](conn, meta):
+        h["heartbeat_leases"](conn, [_lease("message", "r1")])  # must not raise
+        raise RuntimeError("stream blew up")
+
+    # The beat was part of the rolled-back transaction: heartbeat unchanged.
+    (beat,) = conn.conn.execute(
+        "SELECT heartbeat_at FROM _dtex_leases WHERE stream = 'message'"
+    ).fetchone()
+    assert abs((beat - stale.replace(tzinfo=None)).total_seconds()) < 1
+
+    # And the connection is NOT wedged: outside a transaction the refresh and
+    # the release both still commit on their own.
+    h["heartbeat_leases"](conn, [_lease("message", "r1")])
+    (beat,) = conn.conn.execute(
+        "SELECT heartbeat_at FROM _dtex_leases WHERE stream = 'message'"
+    ).fetchone()
+    assert (_now().replace(tzinfo=None) - beat).total_seconds() < 60
+    _release(h, conn, _lease("message", "r1", status=LeaseStatus.DONE))
+    assert conn.conn.execute(
+        "SELECT status FROM _dtex_leases WHERE stream = 'message'"
+    ).fetchone() == ("done",)
+    h["close"](conn)

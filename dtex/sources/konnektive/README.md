@@ -79,8 +79,15 @@ form body** by default, so neither ever appears in a URL — URLs end up in
 proxy logs, in `urllib3`'s DEBUG output and in exception messages. Set
 `http_method: GET` only for an account or proxy that rejects POST.
 
-Create a dedicated API user in the CRM (Admin → Users, type *API*), and if
-the account enforces an IP allow-list, add the runner's egress IP.
+Create a dedicated API user in the CRM (Admin → Users, type *API*).
+
+**Konnektive enforces an IP allow-list per API user.** A call from anywhere
+else is rejected with `IP must be whitelisted - <your egress IP>` — the
+message names the address to add. Plan the runner around this: it needs a
+**stable egress IP**. A laptop, a default Cloud Build pool, GitHub-hosted
+Actions runners and most serverless platforms egress from changing
+addresses; route them through a NAT gateway with a reserved IP (or run on a
+host that has one) and allow-list that.
 
 An auth failure is raised immediately and **never retried** — repeated bad
 logins can lock the API user.
@@ -156,7 +163,8 @@ Steady-state runs cost a handful of requests per stream.
 
 | Symptom | Cause |
 | --- | --- |
-| `KonnektiveAuthError: API rejected the request` | Wrong login id / password, the user is not an API user, or the runner's IP is not allow-listed. Not retried. |
+| `KonnektiveAuthError: ... 'IP must be whitelisted - 203.0.113.7'` | The runner's egress IP is not on the API user's allow-list. Add the address the message names. Not retried. |
+| `KonnektiveAuthError: API rejected the request` (other text) | Wrong login id / password, or the user is not an API user. Not retried. |
 | `API error after N retries: '...'` | Konnektive kept answering `result: ERROR` with a message that is neither "no results" nor auth. The message is the server's own. |
 | `network failure after N retries (ReadTimeout)` | A request exceeded `timeout_seconds`. Narrow `window_days`, or raise the timeout. |
 | Newest rows arrive one run late | `account_timezone` is west of the account's real zone, so "now" falls short. |

@@ -272,6 +272,21 @@ def test_auth_error_raises_immediately_and_is_never_retried(
     assert len(stub.captured) == 1, "retrying bad credentials can lock the API user"
 
 
+def test_ip_allow_list_rejection_is_an_auth_error_naming_the_ip(
+    kon_stub: tuple[_Stub, str],
+) -> None:
+    """Verbatim from the live API (2026-09-21). The message carries the
+    caller's egress IP — the one thing the operator needs — so it must
+    survive into the raised error, and must not be retried."""
+    stub, base_url = kon_stub
+    stub.router = lambda _r: (200, _error("IP must be whitelisted - 203.0.113.7"), {})
+
+    with pytest.raises(KonnektiveAuthError, match=r"IP must be whitelisted - 203\.0\.113\.7"):
+        list(_client(base_url, max_retries=5).query("order/query", {}))
+
+    assert len(stub.captured) == 1
+
+
 def test_auth_error_that_says_not_found_is_not_an_empty_window(
     kon_stub: tuple[_Stub, str],
 ) -> None:

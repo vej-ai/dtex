@@ -8,14 +8,14 @@ and points :class:`RevenueCatClient` at it. The stub records every
 request and responds based on a scripted scenario — no real network
 calls, no flakes from upstream availability.
 
-Three test areas:
+Test areas:
 
 * `RevenueCatClient` unit tests — auth header shape, retry-on-429,
   retry-on-5xx, retry-on-network-error, bounded retries.
 * `paginate` walks RC's `next_page`-URL pagination correctly.
-* The three `@stream` functions (`customers`, `subscriptions`,
-  `metrics_daily`) extract the expected rows when wired into a tmp
-  project with `dtex.run`.
+* The `customers` stream lands rows through `dtex.run`, and the API key
+  never reaches the logs. Everything else about the streams lives in
+  `test_revenuecat_streams.py`, against a routed fake of the API.
 """
 
 from __future__ import annotations
@@ -136,6 +136,7 @@ def _client(base_url: str, *, max_retries: int = 3) -> RevenueCatClient:
         project_id="proj_test",
         base_url=base_url,
         max_retries=max_retries,
+        rate_per_second=0,  # unthrottled: the retry tests count time.sleep calls
     )
 
 
@@ -325,6 +326,9 @@ def _write_config(tmp_path: Path, *, base_url: str, streams: str) -> None:
         "destination: duckdb\n"
         "target: dev\n"
         f"params:\n  project_id: 'proj_test'\n  base_url: '{base_url}'\n"
+        # One sequential chain and no throttle: the scripted response queue
+        # below answers requests strictly in order.
+        "  customers_walk_chains: 1\n  rate_per_second: 0\n"
         f"streams:\n{streams}\n"
     )
 
@@ -384,95 +388,6 @@ def test_end_to_end_customers(
         ("cus_1", "US", "ios"),
         ("cus_2", "GB", "android"),
     ]
-
-
-def test_end_to_end_metrics_daily(
-    rc_stub: tuple[_Scenario, str],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """metrics_daily flattens the values array into long format + advances the
-    cursor only past complete days."""
-    scenario, base_url = rc_stub
-    monkeypatch.setenv("REVENUECAT_API_KEY", "sk_test_unit")
-
-    # Each chart returns its own response (4 charts × 1 GET each, since
-    # default `metrics_charts = "revenue,mrr,actives,trials"`).
-    # cohort 1700000000 = 2023-11-14 UTC.
-    # cohort 1700086400 = 2023-11-15 UTC.
-    def chart_response(measures: list[str]) -> dict[str, Any]:
-        return {
-            "measures": [{"display_name": m} for m in measures],
-            "values": [
-                # Day 1 — complete
-                *(
-                    {
-                        "cohort": 1700000000,
-                        "incomplete": False,
-                        "measure": i,
-                        "value": float(i + 1),
-                    }
-                    for i in range(len(measures))
-                ),
-                # Day 2 — incomplete (today)
-                *(
-                    {
-                        "cohort": 1700086400,
-                        "incomplete": True,
-                        "measure": i,
-                        "value": float(i + 10),
-                    }
-                    for i in range(len(measures))
-                ),
-            ],
-        }
-
-    # 4 charts in the default config — each gets its own scenario step.
-    scenario.add(json_body=chart_response(["Revenue", "Transactions"]))
-    scenario.add(json_body=chart_response(["MRR"]))
-    scenario.add(json_body=chart_response(["Actives"]))
-    scenario.add(json_body=chart_response(["Active Trials"]))
-
-    _write_project(tmp_path)
-    _write_config(
-        tmp_path,
-        base_url=base_url,
-        streams=(
-            "  metrics_daily:\n    params:\n"
-            "      metrics_initial_since_date: '2023-11-14'\n"
-            "      metrics_lookback_days: 0"
-        ),
-    )
-
-    db_path = str(tmp_path / "warehouse.duckdb")
-    result = dtex.run(
-        config="rc_test",
-        project_dir=str(tmp_path),
-        destination_params_override={"path": db_path},
-    )
-    assert result.status.value == "succeeded", result.error
-
-    conn = duckdb.connect(db_path)
-    rows = conn.execute(
-        "SELECT chart_name, measure_name, value, incomplete "
-        "FROM metrics_daily ORDER BY chart_name, measure_name, value"
-    ).fetchall()
-    conn.close()
-
-    # 4 charts: revenue (2 measures × 2 days) + 3 single-measure charts (1 × 2 days each)
-    # = 4 + 2 + 2 + 2 = 10 rows.
-    assert len(rows) == 10
-
-    # Confirm the long-format flatten worked: each chart has its measure names.
-    measure_names = {(c, m) for (c, m, _, _) in rows}
-    assert ("revenue", "Revenue") in measure_names
-    assert ("revenue", "Transactions") in measure_names
-    assert ("mrr", "MRR") in measure_names
-    assert ("actives", "Actives") in measure_names
-    assert ("trials", "Active Trials") in measure_names
-
-    # Confirm incomplete=true rows landed too (for re-pull on the next run).
-    assert any(r[3] for r in rows)
 
 
 def test_api_key_never_appears_in_logs(

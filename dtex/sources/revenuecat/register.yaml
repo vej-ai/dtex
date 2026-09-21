@@ -1,39 +1,68 @@
 # RevenueCat — baked source connector for the v2 API
-# (https://api.revenuecat.com/v2). Three streams covering RC's three
-# distinct extraction surfaces:
+# (https://api.revenuecat.com/v2): period-grain subscription transactions,
+# subscriptions, customers, the product catalogue and daily chart metrics.
 #
-# * `customers` — every customer in a project. NON-incremental: RC v2 has
-#   no server-side date filter on /customers (verified June 2026 against
-#   the docs, the airbyte issue 70315, and the RC community forum), so
-#   every run paginates the full customer list. `write_disposition: merge`
-#   on `id` makes re-pulls upsert idempotently.
+# Facts about the v2 API that shape everything below (verified on a
+# production project, 2026-09):
 #
-# * `subscriptions` — per-customer fan-out. RC has no project-level
-#   /subscriptions endpoint, only /customers/{id}/subscriptions, so this
-#   stream iterates the customer list and fetches per-customer
-#   subscriptions. NON-incremental; merge-on-id like customers.
-#   Operationally expensive: O(N+1) HTTP calls per run for N customers.
+# * There is NO change feed. /customers has no date filter and no sort, and a
+#   customer row carries no purchase signal, only first_seen_at /
+#   last_seen_at. Subscriptions exist only per customer
+#   (/customers/{id}/subscriptions) and transactions only per subscription
+#   (/subscriptions/{id}/transactions). Finding out who bought something is
+#   therefore this connector's main job; see targets.py for how, and for why
+#   it never trusts "this customer has no subscriptions".
+# * State is CURRENT state. A refund rewrites the transaction to its
+#   post-refund amount with no timestamp and no original price; a
+#   cancellation or billing issue is just auto_renewal_status /
+#   pending_payment / status as of now. Every such fact is derived from the
+#   DIFFERENCE between two pulls: the diff streams read their previous
+#   snapshot back from the destination (landed.py), keep first-seen values,
+#   and stamp *_detected_at only on an observed transition.
+# * An Apple plan change is a NEW subscription object; a Google renewal chain
+#   stays inside one. One subscription can span products.
+# * Limits: 100 items per page, forward-only cursors, 480 req/min on the
+#   Customer Information domain (the client throttles to rate_per_second
+#   across `workers` threads).
 #
-# * `metrics_daily` — the third surface. RC v2's Charts API
-#   (/charts/{chart_name}) DOES take server-side start_date/end_date
-#   filters AND tags per-day values with `incomplete=true` when the day
-#   is still finalizing. Long format (one row per cohort_date × chart ×
-#   measure) so adding a chart needs zero schema migration. Real
-#   incremental; the cursor advances only past days RC marked complete,
-#   so partial-today re-pulls cleanly on the next run.
+# Streams, in run order (they hand off through the landed tables, so run them
+# from ONE config in this order; `streams: all` does):
+#   products                  whole catalogue, merge on id.
+#   entitlement_products      entitlement -> product mapping.
+#   customers                 the full /customers walk as concurrent chains
+#                             (a few minutes for ~250k customers). Its job is
+#                             first_seen_at / last_seen_at for the sweep.
+#   subscriptions             per-customer fetch for the planned targets:
+#                             change seeds, bootstrap ids, the decaying
+#                             re-check sweep, the hot set, reconciliation
+#                             heals and a cold rotation. Fingerprint diff against the
+#                             landed row -> changed_at and *_detected_at.
+#   customer_details          aliases + attributes, once per customer that has
+#                             a subscription.
+#   subscription_transactions every period of each new or changed
+#                             subscription; keeps the first-seen gross and
+#                             stamps refund_detected_at when gross drops.
+#   reconciliation_daily      landed transactions per day vs RC's own count.
+#   metrics_daily             RC charts, long format.
 #
-# Auth: a v2 RC secret key (`sk_...`) with at minimum
-# `customer_information:customers:read`,
-# `customer_information:subscriptions:read`, and
-# `charts_metrics:overview:read`. v2 keys are SEPARATE from v1 keys
-# ("API v1 keys will not work with REST API v2" — RC docs). The default
-# reads it from `${env.REVENUECAT_API_KEY}`; profile-level secret://
-# refs (GCP Secret Manager / AWS / Vault) override per environment.
+# The four diff streams (subscriptions, customer_details,
+# subscription_transactions, reconciliation_daily) need `landed_reader` and
+# `landed_dataset` pointed at the destination this config writes to, under
+# the default table names. The other four run without.
+#
+# Scale envelope: the hot set is re-fetched every run, one call per customer,
+# so an hourly cadence fits roughly 15-20k recently-active subscribers at the
+# default rate. Beyond that, lower the cadence or raise rate_per_second if
+# RevenueCat raised your limit.
+#
+# Auth: a v2 secret key (`sk_...`; v1 keys do not work on v2) with
+# customer_information:* read, project_configuration:* read (products,
+# entitlements) and charts_metrics:* read.
 
 name: revenuecat
 kind: source
-version: "1.0.0"
-summary: RevenueCat v2 API — customers, subscriptions, and daily chart metrics.
+version: "2.0.0"
+summary: RevenueCat v2 API — period-grain subscription transactions, subscriptions, customers, products and daily chart metrics, with a built-in completeness check.
 tags: [revenuecat, saas, subscriptions, analytics, mobile]
 
 requires:
@@ -47,52 +76,163 @@ params:
   base_url:
     type: string
     default: "https://api.revenuecat.com/v2"
-    description: RevenueCat v2 API base URL — overridable for stubbed tests.
+    description: RevenueCat v2 API base URL, overridable for stubbed tests.
   page_size:
     type: int
     default: 100
-    description: Records per page on list endpoints (RC default is 20).
+    description: Items per page on list endpoints (RC caps at 100).
+  rate_per_second:
+    type: float
+    default: 7.0
+    description: Client-side request throttle shared by all worker threads. 480 req/min is the Customer Information limit; 7/s leaves headroom. 0 disables the throttle.
+  workers:
+    type: int
+    default: 8
+    description: Concurrent requests for the per-customer and per-subscription fan-outs and for the chains of the customers walk.
+  max_retries:
+    type: int
+    default: 5
+    description: Bounded retries for network errors, 429 and 5xx.
+  batch_size:
+    type: int
+    default: 500
+    description: Records per yielded batch (each batch is one load + merge in the destination).
+  customers_batch_size:
+    type: int
+    default: 20000
+    description: Rows per yielded batch for the customers walk. A quarter of a million customers in 500-row batches is 500 merges; 20k rows per batch keeps the walk at about a dozen loads.
+  customers_walk_chains:
+    type: int
+    default: 33
+    description: "More than 1: walk /customers as 33 concurrent cursor chains (boundaries 0-f and $RCAnonymousID:0-f plus one chain from the start; gap-free whatever order RC lists customers in). 1: a single sequential chain."
+  customers_max_pages:
+    type: int
+    default: 0
+    description: Safety cap on pages per chain of the customers walk (0 = none). A capped walk is incomplete and says so in the log.
 
-  # --- metrics_daily-only ---------------------------------------------------
-  # Curated charts the metrics_daily stream pulls. Comma-separated chart_name
-  # values from RC's docs. Each chart can return multiple measures
-  # (e.g. churn = Actives + Churned Actives + Churn Rate); the connector
-  # flattens them all into the long-format output.
-  #
-  # The four defaults are charts that return the standard
-  # {cohort, incomplete, measure, value} shape. cohort_explorer and
-  # prediction_explorer return different shapes and will break the flattener
-  # — exclude unless you custom-handle them.
+  # --- read-back of the landed tables (landed.py) ---------------------------
+  landed_reader:
+    type: string
+    default: ""
+    description: "bigquery | duckdb: how the diff streams read the rows landed by earlier runs. Must be the destination this config writes to. Empty: only products, entitlement_products, customers and metrics_daily can run."
+  landed_dataset:
+    type: string
+    default: ""
+    description: "bigquery: project.dataset (auth is the run's application default credentials). duckdb: absolute database path, optionally path#schema."
+
+  # --- who gets fetched (targets.py) ----------------------------------------
+  hot_window_days:
+    type: int
+    default: 90
+    description: A customer is re-fetched every run while any subscription is active or ended within this many days (renewals, cancellations, billing issues and refunds all happen server-side).
+  sweep_initial_days:
+    type: int
+    default: 7
+    description: Where the re-check sweep starts when there is no watermark yet (first run). Customers seen inside this window, plus older ones with a checkpoint inside it, are fetched; the backlog is spread over runs by max_customers_per_run.
+  cold_refresh_per_run:
+    type: int
+    default: 300
+    description: Customers whose subscriptions all ended before the hot window, re-fetched per run, stalest first. Catches a resubscription made outside the app. 0 disables the rotation.
+  max_customers_per_run:
+    type: int
+    default: 8000
+    description: Cap on per-customer subscription fetches per run (~19 min at 7 req/s). What does not fit stays due; the sweep always keeps at least a quarter of the cap.
+  empty_recheck_hours:
+    type: int
+    default: 24
+    description: How long an id that came back empty is left alone, for the reconciliation-heal and bootstrap tiers and for subscriptions without transactions ONLY. The sweep, the hot set and the seeds never skip anyone.
+  seed_customers_sql:
+    type: string
+    default: ""
+    description: "Optional. A statement run through landed_reader whose FIRST column is RC customer ids that probably changed recently (e.g. from an attribution or webhook table you already land). Fetched first, every run. A failing query is logged and ignored."
+  seed_store_ids_sql:
+    type: string
+    default: ""
+    description: "Optional. Like seed_customers_sql, but the first column is STORE subscription ids (Apple transaction ids, Google purchase tokens' order ids); each is resolved to its customer with one search call."
+  bootstrap_customers_sql:
+    type: string
+    default: ""
+    description: "Optional. First column = customer ids that are KNOWN to have transacted (e.g. from RevenueCat's scheduled export). Ids with no landed subscription are proven gaps and are fetched right after the seeds: seeds history on a first run, safety net afterwards."
+
+  # --- customer_details / subscription_transactions -------------------------
+  max_details_per_run:
+    type: int
+    default: 3000
+    description: Cap on customer_details hydrations per run (2 calls each), newest subscribers first.
+  max_subscriptions_per_run:
+    type: int
+    default: 8000
+    description: Cap on per-subscription transaction fetches per run. Subscriptions without landed transactions go first; changed ones that do not fit stay ahead of the watermark.
+  txn_lookback_hours:
+    type: int
+    default: 3
+    description: Where subscription_transactions starts looking for changed subscriptions when it has no watermark yet (first run). Afterwards the watermark decides.
+
+  # --- reconciliation_daily ---------------------------------------------------
+  reconcile_days:
+    type: int
+    default: 14
+    description: Trailing days compared against RC's revenue chart on every run. 0 disables the stream.
+  reconcile_heal_days:
+    type: int
+    default: 3
+    description: A complete day inside this window on which RC counts more transactions than were landed makes `subscriptions` re-check every customer seen around that day. 0 disables healing (the table is still written).
+
+  # --- metrics_daily ----------------------------------------------------------
+  # The defaults are charts that return the standard {cohort, incomplete,
+  # measure, value} shape. cohort_explorer and prediction_explorer return
+  # different shapes and would break the flattener.
   metrics_charts:
     type: string
     default: "revenue,mrr,actives,trials"
     description: Comma-separated chart_name values for the metrics_daily stream.
-
-  # Earliest cohort date for the FIRST metrics_daily run. Once state exists
-  # this is ignored. ISO date, no time component.
   metrics_initial_since_date:
     type: string
     default: "2024-01-01"
-    description: Earliest start_date for metrics_daily's first run.
-
-  # Re-pull window for metrics_daily: every run pulls from
-  # max(cursor, today - lookback_days) up to today. Wider window = more
-  # rate-limit churn but better safety for RC's "most recent day may be
-  # partial" caveat. 7 is safely past RC's same-day finalization window
-  # without burning many calls.
+    description: Earliest cohort date for metrics_daily's first run (ISO date). Ignored once a cursor exists.
   metrics_lookback_days:
     type: int
     default: 7
-    description: Days of overlap on every metrics_daily run (handles partial-today + late corrections).
+    description: Trailing days re-pulled on every metrics_daily run. RC keeps revising a day after it stops being incomplete.
 
 secrets:
-  # The RC v2 secret key. The env-var default lets `pip install dtex`
-  # users get going without any extras; profile-level overrides
-  # (`ref: secret://gcp-secret-manager/...`) work for production.
+  # The env-var default lets a fresh install run without extras; a
+  # profile-level `ref: secret://gcp-secret-manager/...` overrides it.
   - name: api_key
     ref: ${env.REVENUECAT_API_KEY}
 
 streams:
+  - name: products
+    table: products
+    primary_key: [id]
+    write_disposition: merge
+    schema:
+      - {name: id,                    type: STRING,    mode: REQUIRED}
+      - {name: store_identifier,      type: STRING,    description: "Store product id; joins subscription_transactions.product_store_identifier."}
+      - {name: app_id,                type: STRING}
+      - {name: type,                  type: STRING}
+      - {name: display_name,          type: STRING}
+      - {name: duration,              type: STRING,    description: "ISO 8601 period (P1M, P1Y) when RC knows it; NULL for part of the catalogue, derive from the identifier downstream."}
+      - {name: trial_duration,        type: STRING}
+      - {name: grace_period_duration, type: STRING}
+      - {name: extracted_at,          type: TIMESTAMP, mode: REQUIRED}
+
+  # entitlement -> product mapping. A v2 subscription object lists its
+  # entitlements only while they are active (an expired subscription comes
+  # back with an empty list), so "which entitlement did this period grant" is
+  # answered from this table via the product, not from the subscription.
+  - name: entitlement_products
+    table: entitlement_products
+    primary_key: [entitlement_id, product_id]
+    write_disposition: merge
+    schema:
+      - {name: entitlement_id,           type: STRING,    mode: REQUIRED}
+      - {name: entitlement_lookup_key,   type: STRING,    description: "The entitlement identifier the app checks."}
+      - {name: entitlement_display_name, type: STRING}
+      - {name: product_id,               type: STRING,    mode: REQUIRED}
+      - {name: product_store_identifier, type: STRING}
+      - {name: extracted_at,             type: TIMESTAMP, mode: REQUIRED}
+
   - name: customers
     table: customers
     primary_key: [id]
@@ -104,31 +244,110 @@ streams:
       - {name: last_seen_app_version, type: STRING}
       - {name: last_seen_country,     type: STRING}
       - {name: last_seen_platform,    type: STRING}
+      # NULLABLE on purpose: a customers table landed by connector 1.x has
+      # no such column, and BigQuery cannot add a REQUIRED column to an
+      # existing table. The walk re-merges every customer, so old rows pick
+      # it up on the first run. The latest value is the age of the snapshot
+      # the subscriptions stream plans from.
+      - {name: extracted_at,          type: TIMESTAMP}
 
   - name: subscriptions
     table: subscriptions
     primary_key: [id]
     write_disposition: merge
     schema:
-      - {name: id,                             type: STRING,    mode: REQUIRED}
-      - {name: customer_id,                    type: STRING}
-      - {name: customer_last_seen_at,          type: TIMESTAMP}
-      - {name: product_id,                     type: STRING}
-      - {name: status,                         type: STRING}
-      - {name: gives_access,                   type: BOOLEAN}
-      - {name: auto_renewal_status,            type: STRING}
-      - {name: store,                          type: STRING}
-      - {name: store_subscription_identifier,  type: STRING}
-      - {name: current_period_starts_at,       type: TIMESTAMP}
-      - {name: current_period_ends_at,         type: TIMESTAMP}
-      - {name: total_revenue_gross_usd,        type: FLOAT}
-      - {name: total_revenue_proceeds_usd,     type: FLOAT}
+      - {name: id,                            type: STRING,    mode: REQUIRED, description: "RC subscription id (sub...)."}
+      - {name: customer_id,                   type: STRING,    mode: REQUIRED, description: "Canonical RC customer id (the app user id the customer is currently identified by)."}
+      - {name: original_customer_id,          type: STRING}
+      - {name: product_id,                    type: STRING,    description: "RC product id; join products for the store identifier and duration."}
+      - {name: entitlement_lookup_keys,       type: STRING,    description: "Comma-joined entitlement lookup keys; empty once the subscription expired, see entitlement_products."}
+      - {name: status,                        type: STRING}
+      - {name: gives_access,                  type: BOOLEAN}
+      - {name: auto_renewal_status,           type: STRING}
+      - {name: pending_payment,               type: BOOLEAN}
+      - {name: ownership,                     type: STRING}
+      - {name: environment,                   type: STRING,    description: "production | sandbox."}
+      - {name: store,                         type: STRING}
+      - {name: store_subscription_identifier, type: STRING,    description: "LATEST period's store transaction id (not the original)."}
+      - {name: country,                       type: STRING}
+      - {name: presented_offering_id,         type: STRING}
+      - {name: starts_at,                     type: TIMESTAMP}
+      - {name: ends_at,                       type: TIMESTAMP}
+      - {name: current_period_starts_at,      type: TIMESTAMP}
+      - {name: current_period_ends_at,        type: TIMESTAMP}
+      - {name: total_revenue_gross_usd,       type: FLOAT}
+      - {name: total_revenue_tax_usd,         type: FLOAT}
+      - {name: total_revenue_commission_usd,  type: FLOAT}
+      - {name: total_revenue_proceeds_usd,    type: FLOAT}
+      - {name: pending_changes,               type: JSON}
+      - {name: first_extracted_at,            type: TIMESTAMP, mode: REQUIRED, description: "When this source first saw the subscription (carried across runs)."}
+      - {name: extracted_at,                  type: TIMESTAMP, mode: REQUIRED}
+      - {name: changed_at,                    type: TIMESTAMP, mode: REQUIRED, description: "Last run in which the fingerprint (status, renewal status, period end, gross, product) differed from the landed row; first_extracted_at for a new row."}
+      - {name: auto_renew_off_detected_at,    type: TIMESTAMP, description: "First run that saw auto-renew turned off AFTER a landed row had it on. RC exposes no cancel timestamp; resolution is the run cadence."}
+      - {name: billing_issue_detected_at,     type: TIMESTAMP, description: "First run that saw pending_payment or in_billing_retry after a landed row without it."}
+      - {name: refund_detected_at,            type: TIMESTAMP, description: "First run that saw total gross fall below the landed value."}
 
-  # metrics_daily — long format (one row per cohort_date × chart × measure).
-  # Adding a new chart to `metrics_charts` requires no schema change.
-  # Cursor on `cohort_date`; the connector observes only complete days
-  # (incomplete=false in the API response) so the next run re-pulls
-  # today AND any day that was still partial last run.
+  - name: customer_details
+    table: customer_details
+    primary_key: [customer_id]
+    write_disposition: merge
+    schema:
+      - {name: customer_id,            type: STRING,    mode: REQUIRED}
+      - {name: original_app_user_id,   type: STRING,    description: "The $RCAnonymousID alias when one exists, else the customer id."}
+      - {name: aliases,                type: STRING,    description: "Comma-joined app user ids merged into this customer."}
+      - {name: email,                  type: STRING,    description: "$email attribute, falling back to an app-set `email` attribute."}
+      - {name: attributes,             type: JSON,      description: "Every customer attribute as name -> value, unmodified. Attribute names are the tenant's own."}
+      - {name: extracted_at,           type: TIMESTAMP, mode: REQUIRED}
+
+  - name: subscription_transactions
+    table: subscription_transactions
+    primary_key: [id]
+    write_disposition: merge
+    partition_by: purchased_at
+    schema:
+      - {name: id,                        type: STRING,    mode: REQUIRED, description: "Store transaction id (Apple transaction id, Google order id)."}
+      - {name: subscription_id,           type: STRING,    mode: REQUIRED}
+      - {name: customer_id,               type: STRING,    mode: REQUIRED}
+      - {name: store,                     type: STRING}
+      - {name: environment,               type: STRING}
+      - {name: product_store_identifier,  type: STRING,    description: "Store product id of THIS period; one subscription can span products."}
+      - {name: period_index,              type: INTEGER,   description: "1-based rank of the period inside its RC subscription by purchased_at. An Apple plan change is a NEW RC subscription, so this restarts there."}
+      - {name: purchased_at,              type: TIMESTAMP, mode: REQUIRED, description: "Start of the billing period."}
+      - {name: expiration_date,           type: TIMESTAMP, description: "Scheduled end of the period."}
+      - {name: effective_expiration_date, type: TIMESTAMP, description: "End of access including grace periods and extensions."}
+      - {name: currency,                  type: STRING,    description: "Purchase currency."}
+      - {name: gross_local,               type: FLOAT,     description: "CURRENT gross in purchase currency, i.e. after refunds."}
+      - {name: tax_local,                 type: FLOAT}
+      - {name: commission_local,          type: FLOAT}
+      - {name: proceeds_local,            type: FLOAT}
+      - {name: gross_usd,                 type: FLOAT,     description: "CURRENT gross USD, i.e. after refunds."}
+      - {name: tax_usd,                   type: FLOAT}
+      - {name: commission_usd,            type: FLOAT}
+      - {name: proceeds_usd,              type: FLOAT}
+      - {name: first_gross_usd,           type: FLOAT,     description: "Gross USD when this source first saw the row. RC reports post-refund amounts, so this is the only record of the original price after a refund."}
+      - {name: first_gross_local,         type: FLOAT}
+      - {name: first_extracted_at,        type: TIMESTAMP, mode: REQUIRED}
+      - {name: extracted_at,              type: TIMESTAMP, mode: REQUIRED}
+      - {name: refund_detected_at,        type: TIMESTAMP, description: "First run that saw gross_usd fall below the landed value. RC exposes no refund timestamp."}
+
+  # Landed production transactions per UTC day against RC's own count (the
+  # Transactions measure of the revenue chart). `missing` > 0 on a complete
+  # day means purchases this source has not found yet; `subscriptions` heals
+  # the last `reconcile_heal_days`, and a warehouse test on this table is the
+  # alarm for anything older. See the stream docstring for why the two counts
+  # are comparable.
+  - name: reconciliation_daily
+    table: reconciliation_daily
+    primary_key: [day]
+    write_disposition: merge
+    schema:
+      - {name: day,                 type: DATE,      mode: REQUIRED}
+      - {name: rc_transactions,     type: INTEGER,   description: "Transactions measure of RC's revenue chart for the day."}
+      - {name: landed_transactions, type: INTEGER,   description: "Distinct non-sandbox subscription_transactions purchased that UTC day."}
+      - {name: missing,             type: INTEGER,   description: "max(rc_transactions - landed_transactions, 0): a lower bound on transactions not landed yet."}
+      - {name: incomplete,          type: BOOLEAN,   description: "RC still marks the day as incomplete."}
+      - {name: checked_at,          type: TIMESTAMP, mode: REQUIRED}
+
   - name: metrics_daily
     table: metrics_daily
     primary_key: [cohort_date, chart_name, measure_name]
@@ -145,4 +364,4 @@ streams:
       - {name: incomplete,    type: BOOLEAN}
       - {name: pulled_at,     type: TIMESTAMP, mode: REQUIRED}
 
-schedule: "0 */6 * * *"
+schedule: hourly

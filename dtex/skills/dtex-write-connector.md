@@ -77,6 +77,8 @@ streams:
       cursor_type: timestamp   # timestamp | date | integer | string
       initial_value: "2024-01-01T00:00:00Z"
       lookback: 6h             # optional — overlap to catch late-arriving data
+      max_staleness: 2d        # optional — how stale this stream's cursor may
+                               # get before monitoring should flag it
     schema:
       - {name: id,         type: STRING, mode: REQUIRED}
       - {name: updated_at, type: TIMESTAMP, mode: REQUIRED}
@@ -90,6 +92,14 @@ streams:
 - **`incremental.cursor_field` MUST be a column the stream yields** AND
   MUST be in the `schema:` block. Otherwise `cursor.observe()` reads `None`
   and state never advances.
+- **`incremental.max_staleness` declares the stream's natural grain** as a
+  duration (`35d` for a monthly report, `2h` for a half-hourly one). Set it
+  from how often the SOURCE actually produces data, not from how often the
+  pipeline runs — a stream whose upstream closes at weekends, or publishes
+  monthly, is not stale just because the clock moved. dtex never acts on it;
+  `dtex state list --stale` reads it and exits 1 on an overdue cursor, so
+  each stream is judged on its own terms instead of one threshold per
+  project. Omit it and the stream reports as *unchecked*, never as healthy.
 - **`schema` is optional** but recommended. Without it the engine infers
   from the first batch. With it the engine type-coerces every value via
   the NORMALIZE step (string `"1599"` → `INTEGER 1599`, ISO timestamps →

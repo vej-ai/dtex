@@ -10,6 +10,8 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-09-21
+
 ### Added
 
 - Meta connector: `hourly_fields` param for the `insights_hourly` stream,
@@ -1325,7 +1327,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.14.4...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/vej-ai/dtex/releases/tag/v0.15.0
 [0.14.4]: https://github.com/vej-ai/dtex/releases/tag/v0.14.4
 [0.14.3]: https://github.com/vej-ai/dtex/releases/tag/v0.14.3
 [0.14.2]: https://github.com/vej-ai/dtex/releases/tag/v0.14.2

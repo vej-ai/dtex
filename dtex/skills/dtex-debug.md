@@ -96,7 +96,26 @@ override.
 
 ### State doesn't advance between runs
 
-Three usual causes:
+**First, rule out the boring answer: the source had nothing new.** A cursor
+pinned at the true high-water mark of the data is CORRECT, not stuck. Check
+before debugging code:
+
+- Does anything exist past the cursor? `SELECT MAX(<cursor_field>)` on the
+  landed table. If it equals the cursor, nothing was missed or filtered out
+  — nothing was produced.
+- What day is it? A warehouse, a back office or a B2B feed often has no
+  weekend, so a Friday-evening cursor is still correct on Sunday. Group the
+  landed rows by day-of-week before concluding anything.
+- What is the stream's natural grain? A monthly report advances its cursor
+  once a month by design. Declare that with `incremental.max_staleness` so
+  monitoring stops asking it to be daily.
+
+A stream re-pulling the same rows each run without advancing is usually just
+the `lookback` window doing its job — a fixed-size tail, not a growing
+re-crawl.
+
+If data DOES exist past the cursor, then it is a real defect. Three usual
+causes:
 
 1. **Forgot `cursor.observe(...)`** in the `@stream` function's per-row
    loop. The engine commits `cursor.observed_max`; without `observe`,

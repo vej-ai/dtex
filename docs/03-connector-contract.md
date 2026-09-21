@@ -126,6 +126,7 @@ cursor into an API request is Python logic in the body.
 | `lookback` | duration string | No | `null` | Re-fetch window to catch late-arriving rows (e.g. `2d`, `6h`, `30m`). **Applied by the engine**: on a resumed run `cursor.start_value()` is the persisted cursor minus this window. Not applied to `initial_value` or a `since:` override. `int` cursors take a bare number (`"100"`, subtracted as-is) or a unit suffix converted to seconds (`"6h"` → 21600, a Unix-timestamp cursor); `date` cursors round up to whole days; `string` cursors cannot declare one. |
 | `initial_value` | string | No | `null` | Where to start on the first run (e.g. `"2025-01-01"`). |
 | `ordered` | bool | No | `false` | Declare that the stream yields records in non-decreasing cursor order (a keyset walk, a date-window sweep). Only then may a mid-stream state flush persist the cursor observed so far, so a crashed run resumes from its last durable batch. Leave it `false` for any walk that revisits older values late (per-object fan-outs): the engine then keeps the prior cursor at every flush and advances it only when the stream completes, so a crash can never skip rows the run did not reach. |
+| `max_staleness` | duration string | No | `null` | How far this stream's cursor may fall behind the wall clock before an operator should treat it as stuck — the stream's natural grain (e.g. `35d` for a monthly report, `2h` for a half-hourly one). Same `<int><unit>` grammar as `lookback`, but the unit is **required** and the value is always a real duration regardless of `cursor_type`. **dtex never acts on it**: nothing is retried, delayed or failed. It is read by `dtex state list --stale` (§2.2.2). |
 
 #### 2.2.1 The `schema` field list
 
@@ -150,6 +151,60 @@ with inference, ship with an explicit schema.
 The engine always appends one column the connector author never declares:
 
 - `_dtex_synced_at` (`TIMESTAMP`) — load timestamp, set by the engine.
+
+#### 2.2.2 Declaring freshness with `max_staleness`
+
+A zero exit code from `dtex run` means the extraction *worked*. It does not
+mean the data *moved*. The gap between those two is where a pipeline goes
+silently stale: a wedged cursor, a revoked credential that still 200s, an
+upstream report that quietly stopped being generated.
+
+The usual answer is a monitoring query that flags any cursor older than some
+threshold. That works until one config holds streams of different grains —
+and most do. A single project-wide threshold is then simultaneously too tight
+for the slowest stream (a monthly report is "stale" for 29 days out of 31) and
+too loose for the fastest (a half-hourly stream can be dead for a day before
+anyone hears). Teams resolve the contradiction by exempting the noisy streams,
+which removes the check precisely where it was working.
+
+`max_staleness` fixes this by putting the threshold where the grain is already
+known — next to `cursor_field` and `lookback`, in the connector that knows how
+often the source actually produces data:
+
+```yaml
+streams:
+  - name: insights_hourly
+    incremental:
+      cursor_field: date_start
+      max_staleness: 2h          # refreshed every 30 min upstream
+  - name: settlement_details
+    incremental:
+      cursor_field: report_month
+      cursor_type: date
+      max_staleness: 35d         # the report is generated monthly
+```
+
+Then one command judges every stream on its own terms:
+
+```
+$ dtex state list -p adyen_bq --stale
+    STREAM              CURSOR VALUE  FRESHNESS
+ok  payment_accounting  2026-09-20    cursor is 18h old, limit 48h
+ok  settlement_details  2026-08-01    cursor is 20d 6h old, limit 35d
+```
+
+It exits 1 if any stream is over its limit, so it drops into a scheduler,
+a CI job or a build step as a freshness gate.
+
+Three deliberate properties:
+
+* **Undeclared is not healthy.** A stream with no `max_staleness` is reported
+  as *unchecked*, never `ok`. Silently passing an undeclared stream is how a
+  gate stops testing anything without appearing to change.
+* **A non-time cursor is unchecked too.** An `int` cursor is as often an
+  opaque sequence as a Unix timestamp; guessing would invent an age.
+* **It is advisory.** The engine's behaviour does not change. A threshold that
+  is wrong makes an alert wrong, never a run.
 
 ### 2.3 The source-to-destination binding lives in a config
 

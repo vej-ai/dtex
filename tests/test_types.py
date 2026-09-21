@@ -1018,3 +1018,39 @@ def test_incremental_ordered_and_lookback_parse() -> None:
         Incremental.from_dict({"cursor_field": "k", "cursor_type": "string", "lookback": "1d"})
     with pytest.raises(ValueError, match="'ordered' must be a boolean"):
         Incremental.from_dict({"cursor_field": "ts", "ordered": "yes"})
+
+
+def test_incremental_max_staleness_parse() -> None:
+    from datetime import timedelta
+
+    from dtex.types import parse_duration
+
+    inc = Incremental.from_dict({"cursor_field": "ts", "max_staleness": "35d"})
+    assert inc.max_staleness == "35d"
+    assert inc.max_staleness_delta() == timedelta(days=35)
+
+    # Undeclared is "no opinion", not a default threshold.
+    assert Incremental.from_dict({"cursor_field": "ts"}).max_staleness_delta() is None
+
+    assert parse_duration("2h") == timedelta(hours=2)
+    assert parse_duration("90m") == timedelta(minutes=90)
+    assert parse_duration("1w") == timedelta(days=7)
+
+    # Unlike lookback, a bare number has no defensible reading here and the
+    # cursor type is irrelevant — staleness is always wall-clock.
+    with pytest.raises(ValueError, match="invalid duration"):
+        parse_duration("5")
+    with pytest.raises(ValueError, match="must be greater than zero"):
+        parse_duration("0d")
+    assert (
+        Incremental.from_dict(
+            {"cursor_field": "n", "cursor_type": "int", "max_staleness": "6h"}
+        ).max_staleness_delta()
+        == timedelta(hours=6)
+    )
+
+    # Rejected at discovery time, not at run time.
+    with pytest.raises(ValueError, match="invalid duration"):
+        Incremental.from_dict({"cursor_field": "ts", "max_staleness": "soon"})
+    with pytest.raises(ValueError, match="unknown incremental key"):
+        Incremental.from_dict({"cursor_field": "ts", "max_stalenes": "1d"})

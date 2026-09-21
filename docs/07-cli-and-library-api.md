@@ -244,6 +244,7 @@ state rows.
 
 ```bash
 dtex state list -p stripe_prod                       # cursors for this config's source
+dtex state list -p stripe_prod --stale               # freshness gate (exit 1 if stale)
 dtex state reset -p stripe_prod                      # clear all cursors
 dtex state reset -p stripe_prod --stream charges     # clear just one
 ```
@@ -252,6 +253,29 @@ dtex state reset -p stripe_prod --stream charges     # clear just one
 clears the cursor without touching loaded data, so the next run re-extracts
 the window. Both read/write the `_dtex_state` table described in
 [05 — Destinations and State](./05-destinations-and-state.md).
+
+`state list --stale` answers the question a zero exit code from `dtex run`
+cannot: not "did the extraction work?" but "did the data actually move?" It
+compares each stream's cursor age to the `incremental.max_staleness` that
+stream declares ([03 §2.2.2](./03-connector-contract.md)), so streams of
+different grains in one config are each judged on their own terms:
+
+```
+$ dtex state list -p adyen_bq --stale
+    STREAM              CURSOR VALUE  FRESHNESS
+ok  payment_accounting  2026-09-20    cursor is 18h old, limit 48h
+ok  settlement_details  2026-08-01    cursor is 20d 6h old, limit 35d
+
+$ echo $?
+0
+```
+
+It exits 1 when any stream is over its limit, which makes it usable directly
+as a scheduled freshness gate (a cron job, a CI step, a build step) without
+writing a warehouse query. Streams that declare no `max_staleness`, and
+streams whose cursor is not a point in time, are reported as *unchecked*
+rather than `ok` — a gate that silently passes what it cannot evaluate stops
+being a gate.
 
 ### `dtex runs {list|show}` — inspect run history
 

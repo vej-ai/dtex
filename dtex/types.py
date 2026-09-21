@@ -980,6 +980,28 @@ def parse_lookback(text: str, cursor_type: CursorType) -> timedelta | int:
     return timedelta(seconds=seconds)
 
 
+def parse_duration(text: str) -> timedelta:
+    """Parse a wall-clock duration — ``incremental.max_staleness``, docs/03 §2.2.
+
+    Same ``<int><unit>`` grammar as :func:`parse_lookback` (``"35d"``,
+    ``"6h"``, ``"90m"``) but always a :class:`~datetime.timedelta`, and the
+    unit is REQUIRED: this measures elapsed real time, so a bare number has no
+    defensible reading. Unlike a lookback it does not vary by cursor type — an
+    int cursor's units are the source's business, while staleness is always
+    measured against the clock.
+    """
+    match = _LOOKBACK_RE.match(str(text))
+    if match is None or match.group(2) is None:
+        raise ValueError(
+            f"invalid duration {text!r}: expected <int><unit> with unit "
+            f"s/m/h/d/w (e.g. '35d', '6h')"
+        )
+    seconds = int(match.group(1)) * _LOOKBACK_UNITS[match.group(2)]
+    if seconds <= 0:
+        raise ValueError(f"invalid duration {text!r}: must be greater than zero")
+    return timedelta(seconds=seconds)
+
+
 @dataclass(frozen=True)
 class Incremental:
     """A stream's cursor-based incremental config — mirrors ``register.yaml``.
@@ -997,6 +1019,20 @@ class Incremental:
     fan-out over posts, anything that revisits older values late) keeps the
     PRIOR cursor at every mid-stream flush and advances it only when the
     stream completes, so a failed run cannot skip the rows it never reached.
+
+    ``max_staleness`` declares how far this stream's cursor may fall behind the
+    wall clock before an operator should treat it as stuck — the stream's
+    NATURAL GRAIN as a duration, in the same ``<int><unit>`` grammar as
+    ``lookback``. dtex never acts on it: nothing is retried, delayed or failed
+    because of it. It exists so monitoring can ask each stream what "late"
+    means for IT, instead of applying one project-wide threshold to streams
+    whose cadences differ by orders of magnitude — a monthly report (``35d``)
+    and a half-hourly insights stream (``2h``) otherwise cannot share a config
+    without the alert on one being noise for the other.
+
+    Omitted (the default) means the stream declares no opinion and monitoring
+    should fall back to its own default. ``dtex state list --stale`` reports
+    each stream against this value and exits non-zero if any has exceeded it.
     """
 
     cursor_field: str
@@ -1004,6 +1040,7 @@ class Incremental:
     lookback: str | None = None
     initial_value: str | None = None
     ordered: bool = False
+    max_staleness: str | None = None
 
     def lookback_delta(self) -> timedelta | int | None:
         """The parsed lookback (``None`` when not declared) — see :func:`parse_lookback`."""
@@ -1011,10 +1048,27 @@ class Incremental:
             return None
         return parse_lookback(self.lookback, self.cursor_type)
 
+    def max_staleness_delta(self) -> timedelta | None:
+        """The parsed ``max_staleness`` (``None`` when not declared).
+
+        Always a :class:`~datetime.timedelta`: staleness is elapsed real time,
+        so unlike ``lookback`` it does not vary by cursor type.
+        """
+        if self.max_staleness is None:
+            return None
+        return parse_duration(self.max_staleness)
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Incremental:
         """Build an :class:`Incremental` from a parsed YAML mapping — docs/03 §2.2."""
-        known = {"cursor_field", "cursor_type", "lookback", "initial_value", "ordered"}
+        known = {
+            "cursor_field",
+            "cursor_type",
+            "lookback",
+            "initial_value",
+            "ordered",
+            "max_staleness",
+        }
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"unknown incremental key(s): {', '.join(sorted(unknown))}")
@@ -1023,6 +1077,7 @@ class Incremental:
         lookback = data.get("lookback")
         initial = data.get("initial_value")
         ordered = data.get("ordered", False)
+        staleness = data.get("max_staleness")
         if not isinstance(ordered, bool):
             raise ValueError(f"incremental 'ordered' must be a boolean, got {ordered!r}")
         inc = cls(
@@ -1031,8 +1086,10 @@ class Incremental:
             lookback=None if lookback is None else str(lookback),
             initial_value=None if initial is None else str(initial),
             ordered=ordered,
+            max_staleness=None if staleness is None else str(staleness),
         )
         inc.lookback_delta()  # validate at discovery time, not at run time
+        inc.max_staleness_delta()  # ditto
         return inc
 
 

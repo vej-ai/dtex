@@ -17,6 +17,16 @@ For what is *planned* — versus what has shipped — see
   `outbound_clicks`) without a code change. Defaults to the previous fixed
   list, so existing configs are unchanged; the run fails fast if the list
   drops a key field (`account_id`, `campaign_id`, `date_start`).
+- Declare a stream's natural grain with `incremental.max_staleness` (e.g.
+  `35d` for a monthly report, `2h` for a half-hourly one), and check every
+  stream against its own limit with `dtex state list --stale`, which exits 1
+  if any cursor is overdue. A zero exit code from `dtex run` means the
+  extraction worked, not that the data moved; one project-wide staleness
+  threshold cannot serve streams whose cadences differ by orders of magnitude,
+  which pushes teams to exempt the noisy ones and so lose the check where it
+  was working. Streams declaring no `max_staleness`, and cursors that are not
+  points in time, report as *unchecked* rather than `ok`. Advisory only — no
+  engine behaviour changes.
 
 ## [0.14.4] — 2026-09-12
 

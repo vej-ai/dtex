@@ -19,6 +19,7 @@ import shutil
 import textwrap
 import traceback
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -843,6 +844,91 @@ def test_state_list_after_run(
     assert result.exit_code == 0, _show(result)
     assert "items" in result.output
     assert "events" in result.output
+
+
+def test_state_list_stale_reports_unchecked_streams(
+    runner: CliRunner, cli_project: Path, warehouse: str
+) -> None:
+    """``--stale`` never calls an undeclared stream healthy.
+
+    The echo fixture declares no ``max_staleness``, so every incremental
+    stream must come back UNCHECKED and the command must still exit 0 —
+    "no opinion" is not "fine", but it is also not a failure.
+    """
+    runner.invoke(
+        cli,
+        [
+            "run",
+            "-p",
+            "echo_dev",
+            "--project-dir",
+            str(cli_project),
+            "--destination-param",
+            f"path={warehouse}",
+        ],
+    )
+    result = runner.invoke(
+        cli,
+        [
+            "state",
+            "list",
+            "-p",
+            "echo_dev",
+            "--stale",
+            "--project-dir",
+            str(cli_project),
+            "--destination-param",
+            f"path={warehouse}",
+        ],
+    )
+    assert result.exit_code == 0, _show(result)
+    assert "no max_staleness declared" in result.output
+    assert "were not checked" in result.output
+    assert "STALE" not in result.output
+
+
+def test_state_list_stale_flags_an_overdue_cursor(
+    runner: CliRunner, cli_project: Path, warehouse: str
+) -> None:
+    """A cursor older than its declared limit is STALE and exits non-zero.
+
+    Drives the real path end to end: declare ``max_staleness`` on the
+    fixture, run, then rewind the committed cursor past the limit.
+    """
+    register = cli_project / "sources" / "echo" / "register.yaml"
+    register.write_text(
+        register.read_text().replace(
+            "      cursor_field: updated_at\n      cursor_type: int\n",
+            "      cursor_field: updated_at\n      cursor_type: timestamp\n"
+            "      max_staleness: 6h\n",
+        )
+    )
+    # The declared schema must agree with the new cursor type.
+    register.write_text(
+        register.read_text().replace(
+            "{name: updated_at, type: INTEGER}",
+            "{name: updated_at, type: TIMESTAMP}",
+        )
+    )
+    common = [
+        "--project-dir",
+        str(cli_project),
+        "--destination-param",
+        f"path={warehouse}",
+    ]
+    runner.invoke(cli, ["run", "-p", "echo_dev", *common])
+    stale_at = (datetime.now(tz=UTC) - timedelta(days=3)).isoformat()
+    set_result = runner.invoke(
+        cli,
+        ["state", "set", "-p", "echo_dev", "--stream", "items",
+         "--cursor", stale_at, *common],
+    )
+    assert set_result.exit_code == 0, _show(set_result)
+
+    result = runner.invoke(cli, ["state", "list", "-p", "echo_dev", "--stale", *common])
+    assert result.exit_code == 1, _show(result)
+    assert "STALE" in result.output
+    assert "stale stream(s): items" in result.output
 
 
 def test_state_list_no_state(

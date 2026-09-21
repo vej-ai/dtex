@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Iterator
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -44,7 +44,7 @@ from dtex.sources.konnektive.client import (
     KonnektiveClient,
     KonnektiveError,
 )
-from dtex.sources.konnektive.source import _iter_windows, _parse_datetime, _project
+from dtex.sources.konnektive.source import _iter_windows, _parse_day, _project
 
 # --------------------------------------------------------------------------
 # Stub Konnektive server
@@ -436,34 +436,52 @@ def test_report_accepts_list_and_empty(kon_stub: tuple[_Stub, str]) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_windows_tile_without_gap_or_overlap() -> None:
-    start = datetime(2026, 1, 1, 7, 30, 0)
-    end = datetime(2026, 1, 4, 12, 0, 0)
+def test_windows_are_whole_days_without_gap_or_overlap() -> None:
+    """Konnektive's filter ignores times, so a day must appear in exactly
+    one window — a shared day would be fetched twice."""
+    windows = _iter_windows(date(2026, 1, 1), date(2026, 1, 4), 1)
 
-    windows = _iter_windows(start, end, 1)
-
-    assert windows[0][0] == start
-    assert windows[-1][1] == end
-    for (_, prev_end), (next_start, _) in zip(windows, windows[1:], strict=False):
-        assert next_start - prev_end == timedelta(seconds=1)
-    assert len(windows) == 4
+    assert windows == [(date(2026, 1, d), date(2026, 1, d)) for d in (1, 2, 3, 4)]
 
 
 def test_windows_respect_window_days_and_floor_at_one() -> None:
-    start, end = datetime(2026, 1, 1), datetime(2026, 1, 10, 23, 59, 59)
-    assert len(_iter_windows(start, end, 5)) == 2
-    assert len(_iter_windows(start, end, 0)) == 10
+    first, last = date(2026, 1, 1), date(2026, 1, 10)
+
+    wide = _iter_windows(first, last, 4)
+    assert wide == [
+        (date(2026, 1, 1), date(2026, 1, 4)),
+        (date(2026, 1, 5), date(2026, 1, 8)),
+        (date(2026, 1, 9), date(2026, 1, 10)),
+    ]
+    covered = [s + timedelta(days=i) for s, e in wide for i in range((e - s).days + 1)]
+    assert covered == [first + timedelta(days=i) for i in range(10)], "every day exactly once"
+    assert len(_iter_windows(first, last, 0)) == 10
 
 
 def test_future_cursor_still_yields_one_window() -> None:
-    end = datetime(2026, 1, 1, 12, 0, 0)
-    assert _iter_windows(datetime(2027, 1, 1), end, 1) == [(end, end)]
+    today = date(2026, 1, 1)
+    assert _iter_windows(date(2027, 1, 1), today, 1) == [(today, today)]
 
 
-def test_parse_datetime_accepts_date_datetime_and_iso() -> None:
-    assert _parse_datetime("2026-01-05") == datetime(2026, 1, 5)
-    assert _parse_datetime("2026-01-05 10:11:12") == datetime(2026, 1, 5, 10, 11, 12)
-    assert _parse_datetime("2026-01-05T10:11:12Z") == datetime(2026, 1, 5, 10, 11, 12)
+def test_parse_day_accepts_every_cursor_shape() -> None:
+    expected = date(2026, 1, 5)
+    assert _parse_day("2026-01-05") == expected
+    assert _parse_day("2026-01-05 10:11:12") == expected
+    assert _parse_day("2026-01-05T10:11:12Z") == expected
+    assert _parse_day(datetime(2026, 1, 5, 23, 59)) == expected
+    assert _parse_day(expected) == expected
+
+
+def test_excluded_keys_reach_neither_a_column_nor_raw() -> None:
+    row = {"customerId": 5, "eCommercePassword": "hunter2", "city": "Vilnius"}
+
+    out = _project(
+        row, ("customerId", "eCommercePassword", "raw"), frozenset({"eCommercePassword"})
+    )
+
+    assert out["eCommercePassword"] is None, "even a DECLARED column stays empty"
+    assert out["raw"] == {"customerId": 5, "city": "Vilnius"}
+    assert "eCommercePassword" in row, "the caller's row is not mutated"
 
 
 def test_project_keeps_raw_and_renames_digit_led_keys() -> None:
@@ -516,7 +534,9 @@ def _recent(days_ago: int, clock: str = "10:00:00") -> str:
 
 def _router_for(rows_by_path: dict[str, list[dict[str, Any]]]) -> Responder:
     """Serve each row from the window whose [startDate, endDate] holds its
-    dateUpdated — the way the real API filters."""
+    dateUpdated — the way the real API filters: BY DAY. Any time-of-day in
+    the params is ignored (verified live 2026-09-21), so only the first ten
+    characters of each side take part in the comparison."""
 
     def route(request: _Request) -> tuple[int, Any, dict[str, str]]:
         params = request.params
@@ -526,7 +546,11 @@ def _router_for(rows_by_path: dict[str, list[dict[str, Any]]]) -> Responder:
             if not hits:
                 return 200, _error("No records matching those parameters could be found"), {}
             return 200, {"result": "SUCCESS", "message": hits}, {}
-        hits = [r for r in rows if params["startDate"] <= r["dateUpdated"] <= params["endDate"]]
+        hits = [
+            r
+            for r in rows
+            if params["startDate"][:10] <= r["dateUpdated"][:10] <= params["endDate"][:10]
+        ]
         if not hits:
             return 200, _EMPTY, {}
         return 200, _page(hits, total=len(hits), page=int(params["page"])), {}
@@ -617,10 +641,60 @@ def test_end_to_end_all_streams(
     assert all(r.method == "POST" and r.query == {} for r in stub.captured)
     assert query_requests[0].params["dateRangeType"] == "dateUpdated"
     assert query_requests[0].params["includeCustomFields"] == "1"
-    assert query_requests[0].params["startDate"] == f"{start} 00:00:00"
+    # Bare dates, one whole day per request, consecutive, none repeated.
+    spans = [(r.params["startDate"], r.params["endDate"]) for r in query_requests]
+    assert spans[0] == (start, start)
+    assert all(s == e and len(s) == 10 for s, e in spans)
+    days = [date.fromisoformat(s) for s, _ in spans]
+    assert days == [days[0] + timedelta(days=i) for i in range(len(days))]
 
 
-def test_second_run_starts_from_cursor_minus_lookback(
+def test_default_exclude_fields_never_land(
+    kon_stub: tuple[_Stub, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The API returns credentials and bank-account numbers inside ordinary
+    objects. By default they must not reach the warehouse — not even via
+    ``raw``."""
+    stub, base_url = kon_stub
+    _setenv(monkeypatch)
+    stub.router = _router_for(
+        {
+            "/customer/query/": [
+                {
+                    "customerId": 7,
+                    "dateUpdated": _recent(0, "00:00:01"),
+                    "eCommercePassword": "s3cr3t-hash",
+                    "achAccountNumber": "000123456789",
+                    "achRoutingNumber": "021000021",
+                    "eCommerceLogin": "kept@example.com",
+                }
+            ]
+        }
+    )
+    start = (datetime.now() - timedelta(days=1)).date().isoformat()
+    _write_project(
+        tmp_path, base_url=base_url, extra=f"  start_date: '{start}'\n", streams="  customers:"
+    )
+    db_path = str(tmp_path / "warehouse.duckdb")
+
+    result = dtex.run(
+        config="kon_test",
+        project_dir=str(tmp_path),
+        destination_params_override={"path": db_path},
+    )
+    assert result.status.value == "succeeded", result.error
+
+    conn = duckdb.connect(db_path)
+    (raw,) = conn.execute("SELECT raw FROM customers").fetchone()
+    conn.close()
+    landed = json.loads(raw)
+    assert landed["eCommerceLogin"] == "kept@example.com"
+    for key in ("eCommercePassword", "achAccountNumber", "achRoutingNumber"):
+        assert key not in landed
+    assert "s3cr3t-hash" not in raw and "000123456789" not in raw
+
+
+def test_second_run_starts_from_cursor_day_minus_lookback(
     kon_stub: tuple[_Stub, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stub, base_url = kon_stub
@@ -633,7 +707,7 @@ def test_second_run_starts_from_cursor_minus_lookback(
     _write_project(
         tmp_path,
         base_url=base_url,
-        extra=f"  start_date: '{start}'\n  lookback_hours: 6\n",
+        extra=f"  start_date: '{start}'\n  lookback_days: 1\n",
         streams="  orders:",
     )
     db_path = str(tmp_path / "warehouse.duckdb")
@@ -650,8 +724,11 @@ def test_second_run_starts_from_cursor_minus_lookback(
     second = dtex.run(**kwargs)
     assert second.status.value == "succeeded", second.error
 
-    expected = (_parse_datetime(newest) - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
+    # The cursor is a timestamp ("… 15:30:00"); the walk restarts from the
+    # START of (its day − lookback_days), because the API filters by day.
+    expected = (_parse_day(newest) - timedelta(days=1)).isoformat()
     assert stub.captured[0].params["startDate"] == expected
+    assert stub.captured[0].params["endDate"] == expected
 
     conn = duckdb.connect(db_path)
     assert conn.execute("SELECT COUNT(*) FROM orders").fetchone() == (1,), "merge, not append"

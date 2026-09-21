@@ -17,19 +17,35 @@ refund, a chargeback flag or a rebill re-lands the affected row.
 ## How it syncs
 
 The four query streams are incremental on `dateUpdated`. Every run asks for
-rows *updated* since the cursor minus `lookback_hours` (default 24), in
+rows *updated* since the cursor's day minus `lookback_days` (default 1), in
 `window_days`-wide windows (default 1), 200 rows per page — Konnektive's
 maximum — and merges on the object's id.
+
+### The date filter is day-granular
+
+Konnektive accepts a time in `startDate` / `endDate` **and ignores it**.
+Verified live (2026-09-21): a one-hour window (`12:00:00`–`12:59:59`), bare
+dates, and explicit `00:00:00`–`23:59:59` bounds all returned the identical
+4,366 orders, spanning the whole day. So:
+
+* Windows are whole **calendar days** and requests carry bare dates. A
+  window that began mid-day would silently fetch both days it touches, and
+  its neighbour would fetch one of them again.
+* Lookback is in days. There is no re-pulling "the last six hours" — the
+  day the cursor sits in is always re-pulled in full. A steady-state run
+  therefore costs *today so far* (plus `lookback_days` whole days), which
+  grows through the day: size a frequent schedule by an end-of-day run.
 
 Windows are walked oldest-first and the cursor is committed **per completed
 window**, so a long history backfill that dies partway resumes from its last
 finished window rather than from `start_date`.
 
 Small windows are deliberate. Konnektive paginates by page *number*, so a
-row updated while a walk is in progress shifts the pages behind it. Shallow
-walks keep that exposure small, and a row that does slip comes back anyway:
-being updated gives it a newer `dateUpdated`, which a later window or the
-next run's lookback picks up.
+row updated while a walk is in progress leaves its day and shifts the pages
+behind it. The row that moved is safe — its new `dateUpdated` puts it in a
+later window. A *bystander* skipped by the shift is only re-fetched if its
+day is walked again, which is what `lookback_days` is for: the default of 1
+re-walks yesterday, the one past day still being edited heavily.
 
 `summary` issues one request per day and re-pulls the trailing
 `summary_lookback_days` (default 35) on every run, because refunds and
@@ -70,6 +86,15 @@ fields are declared as columns under the API's own camelCase names.
 * **One rename.** A key that starts with a digit (`3DTxnResult`) becomes
   `_3DTxnResult` as a column, because warehouses reject a leading digit.
   `raw` keeps the API's spelling.
+* **Never landed by default:** `eCommercePassword`, `achAccountNumber`,
+  `achRoutingNumber`. Konnektive returns these inside ordinary customer /
+  order / transaction objects, and "keep the whole object" must not mean
+  "copy credentials and bank-account numbers into the warehouse". They are
+  stripped before projection (`exclude_fields`), so not even `raw` has them.
+
+The API returns more keys than are declared as columns (coupon, trial, club
+and source fields, among others — about ten to twenty per stream). Those are
+in `raw`.
 
 ## Authentication
 
@@ -140,8 +165,9 @@ streams:
 | --- | --- | --- |
 | `start_date` | *(required)* | First `dateUpdated` pulled when there is no cursor. One request per empty day per stream, so don't set it years early. |
 | `account_timezone` | `America/New_York` | IANA zone of the account. |
-| `window_days` | `1` | Width of one request window. Widen for a low-volume account to shorten a long backfill. |
-| `lookback_hours` | `24` | Overlap re-pulled each run (query streams). |
+| `window_days` | `1` | Width of one request window, in whole days. Widen for a low-volume account to shorten a long backfill. |
+| `lookback_days` | `1` | Whole days re-walked before the cursor's day each run (query streams). `0` is valid — the cursor's own day is always re-pulled. |
+| `exclude_fields` | `eCommercePassword,achAccountNumber,achRoutingNumber` | API keys stripped from every row before projection — they reach neither a column nor `raw`. `""` lands everything. |
 | `summary_lookback_days` | `35` | Trailing days of `summary` re-pulled each run. |
 | `page_size` | `200` | `resultsPerPage`; Konnektive caps it at 200. |
 | `batch_size` | `1000` | Rows per batch handed to the destination. |

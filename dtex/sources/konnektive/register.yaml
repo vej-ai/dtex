@@ -8,10 +8,17 @@
 # * `summary`       — transactions/summary/ (reportType=date), merge on date
 #
 # The four query streams are incremental on `dateUpdated`: every run asks
-# for rows UPDATED since the cursor (minus `lookback_hours`), in
+# for rows UPDATED since the cursor's day (minus `lookback_days`), in
 # `window_days`-wide windows, 200 rows a page, and merges on the object's
 # id. A refund, a chargeback flag or a rebill therefore re-lands the row —
 # the table is current state, not an event log.
+#
+# THE DATE FILTER IS DAY-GRANULAR. Konnektive accepts a time in startDate /
+# endDate and ignores it — verified live 2026-09-21: a one-hour window, bare
+# dates, and explicit 00:00:00-23:59:59 bounds returned the identical 4,366
+# orders spanning the whole day. So windows are whole calendar days, the
+# request carries bare dates, lookback is in days, and the day the cursor
+# sits in is always re-pulled in full.
 #
 # DATE-TIMES ARE ACCOUNT-LOCAL. Konnektive returns wall-clock values in the
 # account's timezone with no offset ("2026-09-18 13:31:23"). They land as
@@ -28,6 +35,11 @@
 # Konnektive adds later is already landed before any connector release.
 # One rename: a key that starts with a digit (`3DTxnResult`) gains a `_`
 # prefix as a column, because warehouses reject it; `raw` keeps it as-is.
+#
+# NEVER LANDED BY DEFAULT: `eCommercePassword`, `achAccountNumber`,
+# `achRoutingNumber` — the API returns these keys on customers / orders /
+# transactions. `exclude_fields` strips them before projection, so they
+# reach neither a column nor `raw`.
 #
 # Auth: a login id + password sent as request parameters on every call
 # (Konnektive has no header scheme). The connector POSTs them in the form
@@ -59,24 +71,37 @@ params:
     default: "America/New_York"
     description: >-
       IANA zone of the Konnektive account (Admin → Settings). Used only to
-      work out "now" in the account's terms for the end of the last window.
-      Konnektive accounts default to US Eastern. Too far west and the
-      newest rows wait for the next run; too far east is harmless.
+      work out which day "today" is in the account's terms, for the last
+      window. Konnektive accounts default to US Eastern. It only matters
+      around midnight: too far west and the first rows of a new day wait
+      for a later run; too far east is harmless.
   window_days:
     type: int
     default: 1
     description: >-
-      Width of one request window, in days. Small windows keep page walks
-      shallow (pagination is by page NUMBER, so rows updated mid-walk shift
-      later pages) and make each request individually retryable. Widen for
-      a low-volume account to cut request count on a long backfill.
-  lookback_hours:
+      Width of one request window, in whole calendar days (Konnektive's
+      date filter ignores times). Small windows keep page walks shallow
+      (pagination is by page NUMBER, so rows updated mid-walk shift later
+      pages) and make each request individually retryable. Widen for a
+      low-volume account to cut request count on a long backfill.
+  lookback_days:
     type: int
-    default: 24
+    default: 1
     description: >-
-      Overlap re-pulled on every incremental run of the four query streams
-      — the start is the cursor minus this. Covers rows that were mid-update
-      during the previous run. Re-pulled rows merge idempotently.
+      Whole days re-walked before the cursor's day on every incremental run
+      of the four query streams. The cursor's own day is ALWAYS re-pulled in
+      full (the filter is day-granular), so 0 is a valid setting; the
+      default of 1 also re-walks yesterday, the one past day still edited
+      heavily enough for a page-shift to skip a bystander row. Re-pulled
+      rows merge idempotently.
+  exclude_fields:
+    type: string
+    default: "eCommercePassword,achAccountNumber,achRoutingNumber"
+    description: >-
+      Comma-separated API keys removed from every row BEFORE projection, so
+      they reach neither a column nor `raw`. The default covers the
+      credentials and bank-account numbers Konnektive includes in customer
+      / order / transaction objects. Set "" to land everything.
   summary_lookback_days:
     type: int
     default: 35
@@ -145,7 +170,7 @@ streams:
       # Windows ascend and the connector observes once per completed
       # window, so the cursor may be persisted mid-stream: a long backfill
       # that dies resumes from its last finished window. Lookback is
-      # applied in the connector (`lookback_hours`) — the value is an
+      # applied in the connector (`lookback_days`) — the value is an
       # account-local wall-clock string, not something the engine can
       # subtract from. No initial_value ON PURPOSE: `start_date` governs.
       ordered: true
@@ -243,7 +268,7 @@ streams:
       # Windows ascend and the connector observes once per completed
       # window, so the cursor may be persisted mid-stream: a long backfill
       # that dies resumes from its last finished window. Lookback is
-      # applied in the connector (`lookback_hours`) — the value is an
+      # applied in the connector (`lookback_days`) — the value is an
       # account-local wall-clock string, not something the engine can
       # subtract from. No initial_value ON PURPOSE: `start_date` governs.
       ordered: true
@@ -341,7 +366,7 @@ streams:
       # Windows ascend and the connector observes once per completed
       # window, so the cursor may be persisted mid-stream: a long backfill
       # that dies resumes from its last finished window. Lookback is
-      # applied in the connector (`lookback_hours`) — the value is an
+      # applied in the connector (`lookback_days`) — the value is an
       # account-local wall-clock string, not something the engine can
       # subtract from. No initial_value ON PURPOSE: `start_date` governs.
       ordered: true
@@ -416,7 +441,7 @@ streams:
       # Windows ascend and the connector observes once per completed
       # window, so the cursor may be persisted mid-stream: a long backfill
       # that dies resumes from its last finished window. Lookback is
-      # applied in the connector (`lookback_hours`) — the value is an
+      # applied in the connector (`lookback_days`) — the value is an
       # account-local wall-clock string, not something the engine can
       # subtract from. No initial_value ON PURPOSE: `start_date` governs.
       ordered: true

@@ -15,16 +15,21 @@ For what is *planned* — versus what has shipped — see
 - **Baked `konnektive` source connector** — the Konnektive (Checkout Champ)
   CRM API. Five `merge` streams: `orders`, `transactions`, `purchases`,
   `customers`, and the per-day `summary` report. The four query streams are
-  incremental on `dateUpdated`, walked in `window_days`-wide windows with a
-  `lookback_hours` overlap; the cursor commits per completed window
-  (`ordered: true`), so a long history backfill resumes where it died.
-  Konnektive's documented fields land as columns under the API's own names,
-  nested values as JSON, and every row carries the whole object under `raw`.
-  Date-times are account-local wall-clock strings and land as `STRING`,
-  untouched. Credentials travel in a POST form body by default so they never
-  appear in a URL; auth failures are raised immediately and never retried;
-  Konnektive's "no results" `ERROR` reads as an empty window. `start_date`
-  is a required param.
+  incremental on `dateUpdated`. Konnektive's date filter is day-granular (a
+  time in `startDate` / `endDate` is accepted and ignored), so the walk is
+  in whole-calendar-day windows (`window_days`) with a `lookback_days`
+  overlap, and the cursor's own day is always re-pulled in full. The cursor
+  commits per completed window (`ordered: true`), so a long history backfill
+  resumes where it died. Konnektive's documented fields land as columns
+  under the API's own names, nested values as JSON, and every row carries
+  the whole object under `raw` — minus `exclude_fields`, which by default
+  strips `eCommercePassword`, `achAccountNumber` and `achRoutingNumber`
+  before anything lands. Date-times are account-local wall-clock strings and
+  land as `STRING`, untouched. Credentials travel in a POST form body by
+  default so they never appear in a URL; auth failures — including
+  Konnektive's per-user IP allow-list rejection — are raised immediately and
+  never retried; its "no results" `ERROR` reads as an empty window.
+  `start_date` is a required param. The runner needs a stable egress IP.
 
 ## [0.15.0] — 2026-09-21
 

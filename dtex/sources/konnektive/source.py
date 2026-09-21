@@ -5,19 +5,32 @@ Four of the streams (``orders``, ``transactions``, ``purchases``,
 ``dateRangeType=dateUpdated`` + ``startDate`` / ``endDate``, paginated 200
 rows at a time, merged on the object's id. ``summary`` is a per-day report.
 
+THE DATE FILTER IS DAY-GRANULAR. Konnektive accepts a time in ``startDate``
+/ ``endDate`` and ignores it: verified live 2026-09-21, a one-hour window
+(``12:00:00``–``12:59:59``), bare dates, and explicit ``00:00:00``–
+``23:59:59`` bounds all returned the identical 4,366 orders spanning the
+whole day. Everything below follows from that:
+
+* Windows are whole CALENDAR DAYS and the request carries bare dates. A
+  window that started mid-day would silently fetch both of the days it
+  touches, and its neighbour would fetch one of them again.
+* Lookback is in days. There is no such thing as re-pulling "the last six
+  hours"; the day the cursor sits in is always re-pulled in full.
+
 How a run walks:
 
-1. Resolve the start: the persisted cursor minus ``lookback_hours``, or the
-   ``start_date`` param on a virgin run (or under ``--full-refresh``).
-2. Tile start → now into ``window_days``-wide windows, ascending. Small
-   windows keep each request cheap and individually retryable, and bound
-   how deep any one page walk goes: Konnektive paginates by page NUMBER, so
-   a row updated mid-walk shifts later pages — the shallower the walk, the
-   smaller that exposure. (A row that does slip gets a newer
-   ``dateUpdated``, so a later window or the next run's lookback picks it
-   up; ``merge`` makes the re-pull idempotent.)
-3. For each window, paginate, project each row onto the declared schema,
-   and keep the whole object beside it under ``raw``.
+1. Resolve the first day: the persisted cursor's date minus
+   ``lookback_days``, or ``start_date`` on a virgin run / ``--full-refresh``.
+2. Tile first day → today into ``window_days``-wide windows, ascending.
+   Small windows keep each request cheap and individually retryable, and
+   bound how deep a page walk goes: Konnektive paginates by page NUMBER, so
+   a row updated mid-walk leaves its day and shifts the pages behind it.
+   The row that moved is safe — its new ``dateUpdated`` puts it in a later
+   window. A bystander skipped by the shift is only re-fetched if its day
+   is walked again, which is what ``lookback_days`` is for: the default
+   re-walks yesterday, the one past day still being edited heavily.
+3. For each window, paginate, drop ``exclude_fields``, project each row onto
+   the declared schema, and keep the whole object beside it under ``raw``.
 4. ``cursor.observe(...)`` once per WINDOW, after that window's last batch
    has been yielded. Windows ascend, so the observed value never decreases
    — which is what lets the streams declare ``ordered: true``: the engine
@@ -30,8 +43,7 @@ All Konnektive date-times are wall-clock values in the ACCOUNT's timezone
 with no offset (``2026-09-18 13:31:23``). They are landed as STRING,
 untouched — typing them TIMESTAMP would stamp them UTC and be wrong by the
 account's offset. The ``account_timezone`` param is used for one thing
-only: working out what "now" is in the account's terms, for the end of the
-last window.
+only: working out which day "today" is in the account's terms.
 """
 
 from __future__ import annotations
@@ -45,12 +57,6 @@ from zoneinfo import ZoneInfo
 from dtex import Batch, Config, Cursor, StreamDef, stream
 
 from .client import MAX_PAGE_SIZE, KonnektiveClient
-
-# The wire format for startDate / endDate AND for the dateUpdated values the
-# API returns — the cursor is stored in the same form, so it compares
-# correctly as a string.
-_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-_DATE_FORMAT = "%Y-%m-%d"
 
 _RAW_COLUMN = "raw"
 
@@ -67,42 +73,56 @@ def _client(config: Config) -> KonnektiveClient:
     )
 
 
-def _now_in_account_tz(config: Config) -> datetime:
-    """The current wall-clock time in the account's timezone, naive."""
-    return datetime.now(tz=ZoneInfo(str(config.account_timezone))).replace(
-        tzinfo=None, microsecond=0
-    )
+def _today_in_account_tz(config: Config) -> date:
+    """Today's date on the account's wall clock."""
+    return datetime.now(tz=ZoneInfo(str(config.account_timezone))).date()
 
 
-def _parse_datetime(value: Any) -> datetime:
-    """A cursor / param value as a naive datetime. Accepts a bare date."""
-    text = str(value).strip().replace("T", " ")
-    if len(text) <= 10:
-        return datetime.strptime(text, _DATE_FORMAT)
-    return datetime.strptime(text[:19], _DATETIME_FORMAT)
+def _parse_day(value: Any) -> date:
+    """The calendar day of a cursor / param value.
+
+    Accepts a bare date, the API's ``YYYY-MM-DD HH:MM:SS``, an ISO ``T``
+    form, and ``date`` / ``datetime`` objects (the engine hands a typed
+    cursor back as one). Only the first ten characters matter.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value).strip()[:10])
 
 
-def _iter_windows(
-    start: datetime, end: datetime, window_days: int
-) -> list[tuple[datetime, datetime]]:
-    """Inclusive ``(start, end)`` windows tiling start → end, ascending.
+def _iter_windows(first: date, last: date, window_days: int) -> list[tuple[date, date]]:
+    """Inclusive whole-day ``(start, end)`` windows tiling first → last.
 
-    Adjacent windows are one second apart (Konnektive's resolution), so no
-    second is requested twice and none is skipped. A start past the end —
-    clock skew, a wrong ``account_timezone``, a cursor from the future —
-    still yields ONE window ending at ``end``: an empty list would sync
+    Adjacent windows share no day and skip none. A first day past the last
+    — clock skew, a wrong ``account_timezone``, a cursor from the future —
+    still yields ONE window covering ``last``: an empty list would sync
     nothing and look healthy.
     """
-    if start > end:
-        start = end
-    span = timedelta(days=max(1, int(window_days)))
-    windows: list[tuple[datetime, datetime]] = []
-    window_start = start
-    while window_start <= end:
-        window_end = min(window_start + span - timedelta(seconds=1), end)
+    if first > last:
+        first = last
+    span = max(1, int(window_days))
+    windows: list[tuple[date, date]] = []
+    window_start = first
+    while window_start <= last:
+        window_end = min(window_start + timedelta(days=span - 1), last)
         windows.append((window_start, window_end))
-        window_start = window_end + timedelta(seconds=1)
+        window_start = window_end + timedelta(days=1)
     return windows
+
+
+def _first_day(cursor: Cursor, config: Config, lookback_days: int) -> date:
+    start_value = cursor.start_value()
+    if start_value is None:
+        return _parse_day(config.start_date)
+    return _parse_day(start_value) - timedelta(days=max(0, lookback_days))
+
+
+def _excluded(config: Config) -> frozenset[str]:
+    return frozenset(
+        name.strip() for name in str(config.exclude_fields or "").split(",") if name.strip()
+    )
 
 
 def _column_name(key: str) -> str:
@@ -112,7 +132,13 @@ def _column_name(key: str) -> str:
     return f"_{key}" if key[:1].isdigit() else key
 
 
-def _project(row: dict[str, Any], columns: tuple[str, ...]) -> dict[str, Any]:
+def _project(
+    row: dict[str, Any], columns: tuple[str, ...], excluded: frozenset[str] = frozenset()
+) -> dict[str, Any]:
+    """Declared columns + the whole object under ``raw``. ``excluded`` keys
+    are removed FIRST, so they reach neither a column nor ``raw``."""
+    if excluded:
+        row = {key: value for key, value in row.items() if key not in excluded}
     renamed = {_column_name(key): value for key, value in row.items()}
     out = {name: renamed.get(name) for name in columns if name != _RAW_COLUMN}
     out[_RAW_COLUMN] = row
@@ -135,22 +161,22 @@ def _extract_query(
     """The shared walk for the four ``*/query/`` streams."""
     client = _client(config)
     columns = _columns(stream_def)
+    excluded = _excluded(config)
     cursor_field = cursor.cursor_field
     batch_size = max(1, int(config.batch_size))
     name = stream_def.name
 
-    start_value = cursor.start_value()
-    if start_value is None:
-        start = _parse_datetime(config.start_date)
-    else:
-        start = _parse_datetime(start_value) - timedelta(hours=int(config.lookback_hours))
-    windows = _iter_windows(start, _now_in_account_tz(config), int(config.window_days))
+    windows = _iter_windows(
+        _first_day(cursor, config, int(config.lookback_days)),
+        _today_in_account_tz(config),
+        int(config.window_days),
+    )
     log.info(
-        "konnektive.%s: %d window(s) from %s to %s",
+        "konnektive.%s: %d window(s), %s → %s",
         name,
         len(windows),
-        windows[0][0].strftime(_DATETIME_FORMAT),
-        windows[-1][1].strftime(_DATETIME_FORMAT),
+        windows[0][0].isoformat(),
+        windows[-1][1].isoformat(),
     )
 
     base_params: dict[str, Any] = {
@@ -164,8 +190,8 @@ def _extract_query(
     batch: list[dict] = []
     for index, (window_start, window_end) in enumerate(windows, start=1):
         params = dict(base_params)
-        params["startDate"] = window_start.strftime(_DATETIME_FORMAT)
-        params["endDate"] = window_end.strftime(_DATETIME_FORMAT)
+        params["startDate"] = window_start.isoformat()
+        params["endDate"] = window_end.isoformat()
 
         window_rows = 0
         window_max: str | None = None
@@ -176,7 +202,7 @@ def _extract_query(
                 text = str(value)
                 if window_max is None or text > window_max:
                     window_max = text
-            batch.append(_project(row, columns))
+            batch.append(_project(row, columns, excluded))
             if len(batch) >= batch_size:
                 yield batch
                 batch = []
@@ -196,7 +222,7 @@ def _extract_query(
                 name,
                 index,
                 len(windows),
-                window_start.strftime(_DATETIME_FORMAT),
+                window_start.isoformat(),
                 window_rows,
                 rows_seen,
             )
@@ -242,16 +268,10 @@ def summary(
     """
     client = _client(config)
     columns = _columns(stream_def)
+    excluded = _excluded(config)
 
-    today = _now_in_account_tz(config).date()
-    start_value = cursor.start_value()
-    if start_value is None:
-        day = _parse_datetime(config.start_date).date()
-    else:
-        day = _parse_datetime(start_value).date() - timedelta(
-            days=int(config.summary_lookback_days)
-        )
-    day = min(day, today)
+    today = _today_in_account_tz(config)
+    day = min(_first_day(cursor, config, int(config.summary_lookback_days)), today)
     log.info("konnektive.summary: %s → %s", day.isoformat(), today.isoformat())
 
     batch: list[dict] = []
@@ -262,12 +282,12 @@ def summary(
             {
                 "reportType": "date",
                 "dateRangeType": "txnDate",
-                "startDate": day.strftime(_DATE_FORMAT),
-                "endDate": day.strftime(_DATE_FORMAT),
+                "startDate": day.isoformat(),
+                "endDate": day.isoformat(),
             },
         )
         for row in rows:
-            record = _project(row, columns)
+            record = _project(row, columns, excluded)
             # The window IS the day; never trust a row to restate it.
             record["date"] = _summary_date(row.get("date"), day)
             batch.append(record)
@@ -287,11 +307,11 @@ def summary(
 
 
 def _summary_date(value: Any, day: date) -> str:
-    """The row's own ``date`` when it parses to the requested day's form,
-    else the requested day — so the merge key is always ``YYYY-MM-DD``."""
+    """The row's own ``date`` when it parses, else the requested day — so
+    the merge key is always ``YYYY-MM-DD``."""
     if value:
         try:
-            return _parse_datetime(value).date().isoformat()
+            return _parse_day(value).isoformat()
         except ValueError:
             pass
     return day.isoformat()

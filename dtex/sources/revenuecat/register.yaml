@@ -26,7 +26,9 @@
 #   across `workers` threads).
 #
 # Streams, in run order (they hand off through the landed tables, so run them
-# from ONE config in this order; `streams: all` does):
+# from ONE config in this order, SEQUENTIALLY: `streams: all` with the default
+# threads=1. Under --threads N each stream reads the previous run's tables and
+# every hand-off slips by one run):
 #   products                  whole catalogue, merge on id.
 #   entitlement_products      entitlement -> product mapping.
 #   customers                 the full /customers walk as concurrent chains

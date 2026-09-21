@@ -10,6 +10,14 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+### Documentation
+
+- **`revenuecat`: run the streams sequentially.** The connector's streams hand
+  off through the landed tables in declared order, which is what the default
+  `threads: 1` gives. A production project whose shared build passed
+  `--threads 6` ran them concurrently: no data was lost, but each hand-off
+  slipped by one run. The README and manifest now say so.
+
 ## [0.17.0] — 2026-09-21
 
 ### Changed

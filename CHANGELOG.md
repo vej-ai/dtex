@@ -10,6 +10,8 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-21
+
 ### Changed
 
 - **Baked `revenuecat` source 2.0: period-grain transactions, and a fetch
@@ -1415,7 +1417,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/vej-ai/dtex/releases/tag/v0.17.0
 [0.16.1]: https://github.com/vej-ai/dtex/releases/tag/v0.16.1
 [0.16.0]: https://github.com/vej-ai/dtex/releases/tag/v0.16.0
 [0.15.0]: https://github.com/vej-ai/dtex/releases/tag/v0.15.0

@@ -189,6 +189,17 @@ run less often, shrink `hot_window_days`, or raise `rate_per_second` if
 RevenueCat raised your limit. `max_customers_per_run` spreads a first run or a
 post-outage backlog over several runs; nothing that does not fit is dropped.
 
+A backlog is worked off oldest checkpoint first, at whatever the cap leaves
+after the hot set, so it clears slowly (the first run's 7-day window was ~21k
+customers on that project, a day of hourly runs). The `subscriptions` log line
+prints `sweep backlog N` on every run. To clear one at once, run the stream
+by hand with a larger cap:
+
+```sh
+dtex run -p revenuecat_bq --select subscriptions,subscription_transactions \
+  --param max_customers_per_run=40000
+```
+
 ## Rate limits and timeouts
 
 RC enforces 480 requests/minute on the Customer Information domain. The client

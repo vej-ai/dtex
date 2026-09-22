@@ -10,6 +10,13 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+### Fixed
+
+- konnektive: Konnektive's per-endpoint refusal (`API user does not have
+  access to this endpoint`) is now an auth error — raised at once, never
+  retried. It was being treated as transient and retried five times, so a
+  missing endpoint permission surfaced after ~70 seconds instead of one.
+
 ## [0.17.0] — 2026-09-21
 
 ### Changed

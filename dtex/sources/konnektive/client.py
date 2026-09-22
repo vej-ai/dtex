@@ -69,10 +69,13 @@ MAX_PAGE_SIZE: int = 200
 # with "No ..." counts, so an error that merely mentions "not found" does not.
 _EMPTY_RESULT = re.compile(r"no\b.*\b(found|matching)\b", re.IGNORECASE | re.DOTALL)
 
-# Auth / permission failures: never retried.
+# Auth / permission failures: never retried. "does not have access" is
+# Konnektive's per-endpoint permission refusal ("API user does not have
+# access to this endpoint", live 2026-09-22) — the API user lacks that
+# endpoint in the CRM; retrying cannot change it.
 _AUTH_FAILURE = re.compile(
     r"login|credential|password|authori[sz]|authenticat|permission|"
-    r"not allowed|access denied|whitelist|ip address",
+    r"not allowed|access denied|(?:not|no) (?:have )?access|whitelist|ip address",
     re.IGNORECASE,
 )
 

@@ -287,6 +287,20 @@ def test_ip_allow_list_rejection_is_an_auth_error_naming_the_ip(
     assert len(stub.captured) == 1
 
 
+def test_endpoint_permission_refusal_is_an_auth_error(kon_stub: tuple[_Stub, str]) -> None:
+    """Verbatim from the live API (2026-09-22): an API user whose CRM role
+    lacks an endpoint. It used to be retried five times (~70 s) before
+    surfacing; nothing about it is transient."""
+    stub, base_url = kon_stub
+    stub.router = lambda _r: (200, _error("API user does not have access to this endpoint"), {})
+
+    with pytest.raises(KonnektiveAuthError, match="does not have access"):
+        client = _client(base_url, max_retries=5)
+        client.report("transactions/summary", {})
+
+    assert len(stub.captured) == 1
+
+
 def test_auth_error_that_says_not_found_is_not_an_empty_window(
     kon_stub: tuple[_Stub, str],
 ) -> None:

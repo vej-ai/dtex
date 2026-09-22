@@ -190,6 +190,7 @@ Steady-state runs cost a handful of requests per stream.
 | Symptom | Cause |
 | --- | --- |
 | `KonnektiveAuthError: ... 'IP must be whitelisted - 203.0.113.7'` | The runner's egress IP is not on the API user's allow-list. Add the address the message names. Not retried. |
+| `KonnektiveAuthError: ... 'API user does not have access to this endpoint'` | The API user's role in the CRM does not include that endpoint. Fix the user's permissions (each stream's endpoint is listed at the top of this README); deselect the stream until then. Not retried. |
 | `KonnektiveAuthError: API rejected the request` (other text) | Wrong login id / password, or the user is not an API user. Not retried. |
 | `API error after N retries: '...'` | Konnektive kept answering `result: ERROR` with a message that is neither "no results" nor auth. The message is the server's own. |
 | `network failure after N retries (ReadTimeout)` | A request exceeded `timeout_seconds`. Narrow `window_days`, or raise the timeout. |

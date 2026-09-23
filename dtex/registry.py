@@ -357,12 +357,13 @@ DESTINATION_HOOKS: frozenset[str] = frozenset(
         "transaction",
         "write_run_record",
         "max_concurrent_writes",
+        "min_batch_rows",
         "close",
     }
 )
 """Every valid ``@destination.*`` hook name — docs/03 §3.4, docs/05 §1.
 
-Fifteen hooks. ``@destination.<anything-else>`` (e.g. a ``write_batchs`` typo)
+Sixteen hooks. ``@destination.<anything-else>`` (e.g. a ``write_batchs`` typo)
 raises :class:`AttributeError` at import time.
 
 ``read_leases`` / ``acquire_leases`` / ``heartbeat_leases`` /
@@ -391,6 +392,16 @@ The engine calls it once per run, after streams finish and before ``close``,
 with a fully-built :class:`~dtex.types.RunRecord`. It is the destination's
 half of the run-record audit table (``_dtex_runs``); the per-run JSONL log
 file is the engine's half and is written regardless of capability.
+
+``min_batch_rows`` is an *optional* hook: when present, the engine reads it
+(with the resolved destination :class:`~dtex.types.Config`) and coalesces a
+stream's source batches until at least that many rows are buffered before each
+``write_batch``. A destination whose per-write cost is fixed and high (BigQuery:
+a GCS upload + load job + MERGE per batch) sets it so a source that yields one
+small page per batch does not pay that cost per page. Buffers are written the
+moment the threshold is reached (no read-ahead), so state flushes keep their
+commit-after-write meaning. Absent or ``0`` ⇒ every source batch is written as
+yielded.
 
 ``max_concurrent_writes`` is an *optional* hook (stage 8e): when present,
 the engine reads it (with the resolved destination :class:`~dtex.types.Config`)

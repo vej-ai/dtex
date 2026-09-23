@@ -269,6 +269,10 @@ def test_destination_full_hook_set_registers() -> None:
         def max_concurrent_writes(config):  # type: ignore[no-untyped-def]
             return 10
 
+        @destination.min_batch_rows
+        def min_batch_rows(config):  # type: ignore[no-untyped-def]
+            return 10_000
+
         @destination.read_leases
         def read_leases(conn, connector):  # type: ignore[no-untyped-def]
             return []
@@ -624,9 +628,10 @@ def test_constants_are_consistent() -> None:
     assert STREAM_INJECTABLES == frozenset(
         {"config", "state", "cursor", "log", "stream_def"}
     )
-    # Fifteen hooks: 11 as of stage 8e + the four batched lease hooks
-    # (read + acquire/heartbeat/release, docs/05 §5.5).
-    assert len(DESTINATION_HOOKS) == 15
+    # Sixteen hooks: 11 as of stage 8e + the four batched lease hooks
+    # (read + acquire/heartbeat/release, docs/05 §5.5) + min_batch_rows.
+    assert len(DESTINATION_HOOKS) == 16
+    assert "min_batch_rows" in DESTINATION_HOOKS
     assert "transaction" in DESTINATION_HOOKS
     assert "write_run_record" in DESTINATION_HOOKS
     assert "max_concurrent_writes" in DESTINATION_HOOKS

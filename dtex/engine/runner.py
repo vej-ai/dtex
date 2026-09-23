@@ -41,6 +41,7 @@ Locked decisions honored here:
 
 from __future__ import annotations
 
+import itertools
 import logging
 import signal
 import sys
@@ -718,6 +719,11 @@ def _resolve_destination_hooks(
     mcw = registry.hook("max_concurrent_writes")
     if mcw is not None:
         hooks["max_concurrent_writes"] = mcw.func
+    # Optional hook: the destination's minimum rows per write. Absent ⇒ every
+    # source batch is written as yielded (see ``_min_batch_rows``).
+    mbr = registry.hook("min_batch_rows")
+    if mbr is not None:
+        hooks["min_batch_rows"] = mbr.func
     return hooks, capabilities
 
 
@@ -986,6 +992,7 @@ def _run_one_stream(
     run_log: RunLog | None = None,
     stream_config_override: Any = None,
     heartbeat: Callable[[], None] | None = None,
+    min_batch_rows: int = 0,
 ) -> StreamResult:
     """Run one stream end to end — docs/02 §Run lifecycle step 5 (a–d).
 
@@ -1282,10 +1289,27 @@ def _run_one_stream(
             )
 
     with _stream_transaction(hooks, conn, meta_cell[0]):
-        if first_batch is not None:
+        if first_batch is not None and min_batch_rows <= 0:
             _load_batch(first_batch)
             for batch in batches:
                 _load_batch(batch)
+        elif first_batch is not None:
+            # Coalesce small source batches into writes of >= min_batch_rows
+            # (destination hook). The buffer is written the moment it reaches
+            # the threshold — before the source is asked for another batch — so
+            # the source's state/cursor at every flush still describes exactly
+            # the rows that are durable. Heartbeats keep the lease alive while
+            # the buffer fills (they self-throttle).
+            pending: list[dict[str, Any]] = []
+            for batch in itertools.chain((first_batch,), batches):
+                pending.extend(batch)
+                if len(pending) >= min_batch_rows:
+                    _load_batch(pending)
+                    pending = []
+                elif heartbeat is not None:
+                    heartbeat()
+            if pending:
+                _load_batch(pending)
 
         cursor_after = cursor_before
         if cursor is not None and cursor.observed_max is not None:
@@ -1397,6 +1421,25 @@ def _split_error(error: BaseException | None) -> tuple[str | None, str | None]:
     if error is None:
         return None, None
     return type(error).__name__, str(error)
+
+
+def _min_batch_rows(
+    hooks: Mapping[str, Callable[..., Any]],
+    dest_config: Config,
+) -> int:
+    """Resolve the destination's ``min_batch_rows`` (0 = no coalescing).
+
+    A destination with a high fixed cost per write (BigQuery: staging upload +
+    load job + MERGE) declares it so sources that yield one API page per batch
+    are coalesced into fewer, larger writes. Invalid values raise: a typo in
+    ``destination_params.min_batch_rows`` should fail the run, not silently
+    fall back to per-page writes.
+    """
+    hook = hooks.get("min_batch_rows")
+    if hook is None:
+        return 0
+    value = int(hook(Config(params=dict(dest_config.params))))
+    return max(0, value)
 
 
 def _stream_write_cap(
@@ -2227,6 +2270,7 @@ def run(
                 )
         requested_threads = max(1, int(threads)) if threads is not None else 1
         dest_cap = _stream_write_cap(hooks, dest_config)
+        coalesce_rows = _min_batch_rows(hooks, dest_config)
         effective_threads = max(1, min(requested_threads, dest_cap))
 
         # -- Leasing: acquire the WHOLE selected set up front, in one batched
@@ -2281,6 +2325,7 @@ def run(
                     log,
                     run_log=run_log,
                     stream_config_override=per_stream_config.get(stream_def.name),
+                    min_batch_rows=coalesce_rows,
                     # The between-batch beat is wired only in the SEQUENTIAL
                     # path, where this *is* the main thread — so the batched
                     # heartbeat statement is still single-threaded. In parallel

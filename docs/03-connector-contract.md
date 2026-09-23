@@ -615,6 +615,7 @@ def close(conn):                         # flush + release — always runs
 | `@destination.transaction` | If `Capability.TRANSACTIONAL_LOAD` | A context-manager hook the engine wraps around each stream's `write_batch`+`commit_state` block, so data and cursor flip atomically. See chapter 05 §1. |
 | `@destination.write_run_record` | If `Capability.RUN_RECORDS` | Persists one `RunRecord` row into `_dtex_runs` — the queryable audit table. Called once per run, after streams finish and before `close`. See chapter 09 §4. |
 | `@destination.max_concurrent_writes` | No (optional) | Returns the maximum number of pipelines that may target this destination concurrently under `dtex run --tag --threads N`. Signature `(config: Config) -> int`. Absent ⇒ unlimited. DuckDB returns 1 (file lock); BigQuery returns 10 by default. See chapter 02 §Concurrency. |
+| `@destination.min_batch_rows` | No (optional) | Minimum rows per `write_batch`. Signature `(config: Config) -> int`. The engine coalesces a stream's source batches until at least this many rows are buffered, writing the buffer the moment the threshold is reached (state flushes stay commit-after-write). Absent or `0` ⇒ each source batch is written as yielded. BigQuery returns 10000 by default (`min_batch_rows` destination param), because every write pays a GCS upload + LOAD (+ MERGE). |
 | `@destination.close` | **Yes** | Flushes and releases resources. Runs even on failure. |
 
 The `Capability` enum referenced above (`STATE`, `MERGE`, `SCHEMA_EVOLUTION`, …)

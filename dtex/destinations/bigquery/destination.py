@@ -234,6 +234,36 @@ def max_concurrent_writes(config: Config) -> int:
     return max(1, value)
 
 
+# Every write is a Parquet upload to GCS + a LOAD job (+ a MERGE for merge
+# streams): several seconds of fixed cost regardless of row count. Sources
+# that yield one API page per batch (Stripe: 100 rows) would pay it per page —
+# a full Stripe backfill measured ~8 s per 100-row page. Coalescing to 10k
+# rows cuts that ~100x while keeping per-write memory modest.
+_DEFAULT_MIN_BATCH_ROWS = 10_000
+
+
+@destination.min_batch_rows
+def min_batch_rows(config: Config) -> int:
+    """Minimum rows per write_batch; the engine coalesces smaller source batches.
+
+    Default :data:`_DEFAULT_MIN_BATCH_ROWS`. Override per target with the
+    ``min_batch_rows`` destination param (``0`` writes every source batch as
+    yielded, the pre-0.18 behaviour).
+    """
+    raw = config.get("min_batch_rows")
+    if raw is None:
+        return _DEFAULT_MIN_BATCH_ROWS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"bigquery destination: 'min_batch_rows' must be a non-negative integer, got {raw!r}"
+        ) from exc
+    if value < 0:
+        raise ValueError(f"bigquery destination: 'min_batch_rows' must be >= 0, got {value}")
+    return value
+
+
 # --------------------------------------------------------------------------
 # open / close — docs/05 §1
 # --------------------------------------------------------------------------

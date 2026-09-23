@@ -81,3 +81,10 @@ params:
     type: int
     default: 10
     description: Max concurrent pipelines that may target this BigQuery destination at once.
+  # Each write is a GCS upload + LOAD (+ MERGE) with seconds of fixed cost, so
+  # the engine coalesces small source batches (e.g. Stripe's 100-row pages) up
+  # to this many rows per write. 0 = write every source batch as yielded.
+  min_batch_rows:
+    type: int
+    default: 10000
+    description: Minimum rows per load; smaller source batches are coalesced (0 disables).

@@ -10,6 +10,21 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+### Added
+
+- **Batch coalescing for destinations with a high per-write cost.** A new
+  optional destination hook, `@destination.min_batch_rows`, lets a
+  destination ask the engine to buffer a stream's source batches until at
+  least that many rows are pending before each `write_batch`. BigQuery
+  declares it (default 10000, `min_batch_rows` destination param; `0` keeps
+  the old one-write-per-batch behaviour): every BigQuery write is a GCS
+  upload + LOAD job (+ MERGE), several seconds of fixed cost, so sources that
+  yield one API page per batch paid it per page — a full Stripe backfill ran
+  at ~8 s per 100-row page (≈3 h for 137k charges). The buffer is written the
+  moment it reaches the threshold, before the source is asked for more, so
+  mid-stream state flushes keep their commit-after-write guarantee; lease
+  heartbeats continue while the buffer fills.
+
 ### Fixed
 
 - konnektive: Konnektive's per-endpoint refusal (`API user does not have

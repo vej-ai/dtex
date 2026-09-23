@@ -1872,6 +1872,7 @@ def test_engine_resolves_destination_hooks_without_transaction(
         "heartbeat_leases",
         "release_leases",
         "max_concurrent_writes",
+        "min_batch_rows",
     }
     assert set(hooks) == expected
     assert "transaction" not in hooks

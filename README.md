@@ -26,7 +26,7 @@ pip install 'dtex[vault]'                 # add the HashiCorp Vault resolver
 
 `pip install dtex` ships every baked source and destination — DuckDB,
 BigQuery, the filesystem source's local + Parquet path, the REST / Postgres
-/ ShipHero / Stripe sources, the engine, the CLI. Extras stay opt-in for the
+/ ShipHero / Stripe / Google Sheets / Google Drive sources, the engine, the CLI. Extras stay opt-in for the
 cloud-storage paths of the filesystem source (`gs://` / `s3://`) and for
 secret managers (only relevant if your `profiles.yml` uses `secret://` URLs).
 
@@ -59,6 +59,8 @@ auth checklist, scope requirements, schema, and known limitations.
 | Connector | What it does |
 |---|---|
 | [`filesystem`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/filesystem/README.md) | CSV / JSONL / Parquet from local, GCS, or S3 |
+| [`google_sheets`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/google_sheets/README.md) | Google Sheets — every tab its own table (discovered at run time), or chosen tabs and A1 ranges; typed dates; ADC or service account |
+| [`google_drive`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/google_drive/README.md) | CSV / XLSX / Google Sheets files in a Drive folder (incl. shared drives), incremental by file |
 | [`rest`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/rest/README.md) | Paginated REST APIs — 4 pagination strategies, 4 auth modes |
 | [`postgres`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/postgres/README.md) | Keyset pagination, no `OFFSET` |
 | [`shiphero`](https://github.com/vej-ai/dtex/blob/main/dtex/sources/shiphero/README.md) | GraphQL |

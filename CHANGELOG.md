@@ -10,6 +10,53 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-09-29
+
+### Added
+
+- **Baked `google_sheets` source.** Point it at a spreadsheet link (or ID) and
+  every tab lands as its own table — `streams: all` picks up tabs added later.
+  `tabs: "Orders!A2:N, Refunds!A2:N10, gid=123"` narrows it to chosen tabs and
+  A1 ranges, open-ended (`A2:N`, to the last row) or bounded; the same knobs
+  (`range`, `header_row`, `columns`) work per stream in a config. Stream names
+  are the slugified tab titles, computed over every tab so a filter never
+  renames one; titles that slugify alike get their permanent gid appended.
+  Values are read unformatted (numbers, booleans, text) and dates from their
+  exact serial numbers, typed per cell by number format (`DATE` → date,
+  `DATE_TIME` → timestamp in the spreadsheet's time zone). Header names
+  become `snake_case` columns (blank → `column_<n>`, duplicates → `_2`), and
+  each column settles on one type. Full refresh (`replace`) per run; a cleared
+  tab clears its table.
+- **Baked `google_drive` source.** CSV, XLSX and native Google Sheets files in
+  a Drive folder — My Drive or a shared drive — unioned into one table like the
+  `filesystem` source (`folder`, `glob` on file names, `recursive`, `format`),
+  incremental by file on a `<modifiedTime>|<fileId>` cursor so each run loads
+  only new or modified files. XLSX via openpyxl with `sheet` (name or position),
+  `range` and `header_row` — the same rules as `google_sheets`, so a CSV and an
+  XLSX with one layout land with the same columns. Records carry
+  `_dtex_file_id`, `_dtex_file_path` and `_dtex_file_cursor`. Several tables
+  from one folder: a project-local copy calling `extract_files(..., glob=…)`
+  per stream.
+- Both Google sources authenticate with Application Default Credentials or a
+  service account (`credentials_path`, or `credentials_json` as a `${env.X}` /
+  `secret://` reference — never an inline key), and retry 429 / 5xx and Drive
+  rate-limit 403s with backoff. `openpyxl` and `google-auth` join the base
+  dependencies.
+- **Discovered streams** (docs/03 §2.2.3). A source can declare a stream
+  *template* (`discover: true`) plus a `@discover(stream=…)` hook that returns
+  `DiscoveredStream(name, table, context)` objects at run time; the engine
+  expands the template into one ordinary stream per result — selectable in
+  `streams:` with per-stream `params`, with its own table and `_dtex_state` row.
+  Name collisions and unknown names are hard errors. `google_sheets` is built
+  on it.
+
+### Fixed
+
+- With batch coalescing on (BigQuery's `min_batch_rows`), a `replace` stream
+  that yielded only an empty batch never reached `write_batch`, so the table
+  kept the previous run's rows instead of being truncated. The empty snapshot
+  is written again, as it is without coalescing.
+
 ## [0.18.0] — 2026-09-24
 
 ### Added
@@ -1441,7 +1488,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/vej-ai/dtex/releases/tag/v0.19.0
 [0.18.0]: https://github.com/vej-ai/dtex/releases/tag/v0.18.0
 [0.17.0]: https://github.com/vej-ai/dtex/releases/tag/v0.17.0
 [0.16.1]: https://github.com/vej-ai/dtex/releases/tag/v0.16.1

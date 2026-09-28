@@ -1382,14 +1382,20 @@ def _run_one_stream(
             # the rows that are durable. Heartbeats keep the lease alive while
             # the buffer fills (they self-throttle).
             pending: list[dict[str, Any]] = []
+            wrote_any = False
             for batch in itertools.chain((first_batch,), batches):
                 pending.extend(batch)
                 if len(pending) >= min_batch_rows:
                     _load_batch(pending)
+                    wrote_any = True
                     pending = []
                 elif heartbeat is not None:
                     heartbeat()
-            if pending:
+            # A stream that yielded only empty batches still reaches
+            # write_batch once, as it does without coalescing: a `replace`
+            # destination truncates on an empty batch (an empty snapshot is a
+            # snapshot), so swallowing it would leave the previous rows behind.
+            if pending or not wrote_any:
                 _load_batch(pending)
 
         cursor_after = cursor_before

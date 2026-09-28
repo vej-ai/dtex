@@ -143,6 +143,13 @@ class AsyncJobFailed(RuntimeError):
     has yielded nothing for the window yet."""
 
 
+class MetaAccessDenied(RuntimeError):
+    """The token's user has no access to this ad account (Graph error code 200
+    or 10: "grant ads_management or ads_read"). Deterministic for the account,
+    not for the run: the other accounts are unaffected, so a caller may skip
+    this one (``skip_inaccessible_accounts``) instead of failing everything."""
+
+
 @dataclass
 class MetaClient:
     """The paced, token-bearing HTTP surface. One instance per run."""
@@ -355,7 +362,8 @@ class MetaClient:
                         " — the token's user lacks access to this ad account "
                         "(assign it with View performance in Business Manager)"
                     )
-                raise RuntimeError(
+                error_cls = MetaAccessDenied if code in (200, 10) else RuntimeError
+                raise error_cls(
                     f"meta: HTTP {resp.status_code} error code {code} on "
                     f"{_redact(url)}: {_redact(str(msg))}{hint}"
                 )

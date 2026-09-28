@@ -55,7 +55,7 @@ from typing import Any
 
 from dtex import Batch, Config, Cursor, stream
 
-from .client import AsyncJobFailed, MetaClient
+from .client import AsyncJobFailed, MetaAccessDenied, MetaClient
 from .records import (
     HOURLY_BREAKDOWN,
     as_date,
@@ -92,6 +92,48 @@ def _build_client(config: Config) -> MetaClient:
         poll_interval_seconds=float(config.poll_interval_seconds),
         job_timeout_seconds=float(config.job_timeout_seconds),
     )
+
+
+def _accessible_accounts(
+    client: MetaClient,
+    accounts: list[str],
+    fields: str,
+    *,
+    skip_inaccessible: bool,
+    name: str,
+    log: logging.Logger,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """``GET act_<id>`` once per account; return the readable ones + their info.
+
+    With ``skip_inaccessible`` an account the token cannot read
+    (:class:`MetaAccessDenied`, Graph code 200/10) is logged and left out of
+    this run, so the other accounts still load. Without it the error
+    propagates exactly as before. A run where NO account is readable fails
+    either way: that is a token problem, not a pending grant.
+    """
+    kept: list[str] = []
+    info: dict[str, dict[str, Any]] = {}
+    for account in accounts:
+        try:
+            info[account] = client.get_account(account, fields)
+        except MetaAccessDenied as exc:
+            if not skip_inaccessible:
+                raise
+            log.warning(
+                "meta.%s: SKIPPING act_%s for this run — %s. The other accounts load "
+                "normally; this one is picked up by the first run after access is granted.",
+                name,
+                account,
+                exc,
+            )
+            continue
+        kept.append(account)
+    if not kept:
+        raise RuntimeError(
+            f"meta.{name}: none of the {len(accounts)} configured ad account(s) is "
+            "readable with this token — nothing to load"
+        )
+    return kept, info
 
 
 def hourly_fields(value: Any) -> str:
@@ -251,13 +293,20 @@ def ads_insights(config: Config, cursor: Cursor, log: logging.Logger) -> Iterato
     def project(row: dict[str, Any], _account: str) -> dict[str, Any] | None:
         return to_record(row, run_ts)
 
+    client = _build_client(config)
+    accounts = parse_accounts(config.account_ids)
+    if bool(config.get("skip_inaccessible_accounts", False)):
+        accounts, _ = _accessible_accounts(
+            client, accounts, "id", skip_inaccessible=True, name="ads_insights", log=log
+        )
+
     yield from _walk(
         name="ads_insights",
         config=config,
         cursor=cursor,
         log=log,
-        client=_build_client(config),
-        accounts=parse_accounts(config.account_ids),
+        client=client,
+        accounts=accounts,
         fields=str(config.fields),
         level="ad",
         breakdowns="",
@@ -280,9 +329,17 @@ def insights_hourly(config: Config, cursor: Cursor, log: logging.Logger) -> Iter
     # Timezone per account, fetched once per run — the hourly breakdown is
     # expressed in it, so it must ride with every row for downstream SQL to
     # convert.
+    accounts, info_by_account = _accessible_accounts(
+        client,
+        accounts,
+        ACCOUNT_TZ_FIELDS,
+        skip_inaccessible=bool(config.get("skip_inaccessible_accounts", False)),
+        name="insights_hourly",
+        log=log,
+    )
     tz_by_account: dict[str, tuple[str | None, float | None]] = {}
     for account in accounts:
-        info = client.get_account(account, ACCOUNT_TZ_FIELDS)
+        info = info_by_account[account]
         tz_name = info.get("timezone_name")
         raw_off = info.get("timezone_offset_hours_utc")
         try:

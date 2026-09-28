@@ -44,6 +44,7 @@ import dtex
 from dtex.sources.meta import client as client_mod
 from dtex.sources.meta.client import (
     AsyncJobFailed,
+    MetaAccessDenied,
     MetaClient,
     _is_rate_limit,
     _max_usage_pct,
@@ -99,11 +100,27 @@ class _Graph:
         self.accounts: dict[str, dict[str, Any]] = {}
         self.overrides: list[tuple[int, Any, dict[str, str]]] = []
         self.submits = 0
+        # Ad account ids the token cannot read: every act_<id> call answers
+        # Graph error 200, as Meta does before access is granted.
+        self.denied: set[str] = set()
 
     def respond(self, req: _Request) -> tuple[int, Any, dict[str, str]]:
         if self.overrides:
             return self.overrides.pop(0)
         parts = req.path.strip("/").split("/")  # [ver, ...]
+        if len(parts) >= 2 and parts[1].startswith("act_") and parts[1][4:] in self.denied:
+            return (
+                403,
+                {
+                    "error": {
+                        "code": 200,
+                        "message": (
+                            "Ad account owner has NOT grant ads_management or ads_read permission"
+                        ),
+                    }
+                },
+                {},
+            )
         if req.method == "POST" and len(parts) == 3 and parts[2] == "insights":
             self.submits += 1
             run_id = f"RUN{self.submits}"
@@ -356,9 +373,10 @@ def test_deterministic_errors_raise_at_once_without_the_token(
 
     graph.captured.clear()
     graph.overrides = [(400, {"error": {"code": 200, "message": "no perms"}}, {})]
-    with pytest.raises(RuntimeError, match="View performance"):
+    with pytest.raises(MetaAccessDenied, match="View performance"):
         list(_client(base_url).iter_insights("111", date(2026, 8, 20), date(2026, 8, 20), "f"))
     assert len(graph.captured) == 1
+    assert issubclass(MetaAccessDenied, RuntimeError)  # callers catching RuntimeError still do
 
 
 def test_hourly_submit_params_and_account_timezone(graph_stub: tuple[_Graph, str]) -> None:
@@ -662,7 +680,13 @@ def _write_project(tmp_path: Path) -> None:
 
 
 def _write_config(
-    tmp_path: Path, *, base_url: str, streams: str, start_date: str, extra_params: str = ""
+    tmp_path: Path,
+    *,
+    base_url: str,
+    streams: str,
+    start_date: str,
+    extra_params: str = "",
+    account_ids: str = "act_111",
 ) -> None:
     (tmp_path / "configs").mkdir(parents=True, exist_ok=True)
     (tmp_path / "configs" / "meta_test.yml").write_text(
@@ -672,7 +696,7 @@ def _write_config(
         "target: dev\n"
         "params:\n"
         f"  base_url: '{base_url}'\n"
-        "  account_ids: 'act_111'\n"
+        f"  account_ids: '{account_ids}'\n"
         f"  start_date: '{start_date}'\n"
         "  window_days: 7\n"
         "  page_delay_seconds: 0\n"
@@ -858,3 +882,110 @@ def test_end_to_end_insights_hourly_extra_fields(
     conn.close()
     parsed = json.loads(outbound) if isinstance(outbound, str) else outbound
     assert parsed == [{"action_type": "outbound_click", "value": "3"}]
+
+
+# --------------------------------------------------------------------------
+# skip_inaccessible_accounts — a newly listed account whose access grant is
+# still pending must not take down every other account's load.
+# --------------------------------------------------------------------------
+
+
+def _two_account_run(
+    graph: _Graph, base_url: str, tmp_path: Path, stream: str, extra_params: str
+) -> tuple[Any, list[tuple[Any, ...]]]:
+    today = datetime.now(tz=UTC).date()
+    day = today.isoformat()
+    graph.accounts["111"] = {
+        "id": "act_111",
+        "timezone_name": "Europe/Vilnius",
+        "timezone_offset_hours_utc": 3,
+    }
+    graph.denied = {"222"}
+    if stream == "insights_hourly":
+        graph.pages = [[_hourly_row(day, "13:00:00 - 13:59:59")]]
+        streams = "  insights_hourly:\n    params:\n      window_days: 30\n"
+        select = "SELECT DISTINCT account_id FROM insights_hourly"
+    else:
+        graph.pages = [[_ad_row(day, ad_id="a1")]]
+        streams = "  ads_insights:"
+        select = "SELECT DISTINCT account_id FROM ads_insights"
+    _write_project(tmp_path)
+    _write_config(
+        tmp_path,
+        base_url=base_url,
+        streams=streams,
+        start_date=day,
+        extra_params=extra_params,
+        account_ids="act_111,act_222",
+    )
+    db_path = str(tmp_path / "warehouse.duckdb")
+    result = dtex.run(
+        config="meta_test", project_dir=str(tmp_path), destination_params_override={"path": db_path}
+    )
+    rows: list[tuple[Any, ...]] = []
+    if result.status.value == "succeeded":
+        conn = duckdb.connect(db_path)
+        rows = conn.execute(select).fetchall()
+        conn.close()
+    return result, rows
+
+
+@pytest.mark.parametrize("stream", ["insights_hourly", "ads_insights"])
+def test_skip_inaccessible_account_loads_the_others(
+    graph_stub: tuple[_Graph, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    stream: str,
+) -> None:
+    graph, base_url = graph_stub
+    monkeypatch.setenv("META_ACCESS_TOKEN", "EAAe2e")
+    result, rows = _two_account_run(
+        graph, base_url, tmp_path, stream, "  skip_inaccessible_accounts: true\n"
+    )
+    assert result.status.value == "succeeded", result.error
+    assert rows == [("111",)]
+    # dtex's logger writes to stderr and does not propagate, so read the stream
+    assert "SKIPPING act_222" in capfd.readouterr().err
+    # the denied account was probed once and never had a report submitted
+    assert not any(r.method == "POST" and "act_222" in r.path for r in graph.captured)
+
+
+@pytest.mark.parametrize("stream", ["insights_hourly", "ads_insights"])
+def test_inaccessible_account_still_fails_by_default(
+    graph_stub: tuple[_Graph, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: str,
+) -> None:
+    graph, base_url = graph_stub
+    monkeypatch.setenv("META_ACCESS_TOKEN", "EAAe2e")
+    result, _ = _two_account_run(graph, base_url, tmp_path, stream, "")
+    assert result.status.value != "succeeded"
+    assert "error code 200" in str(result.error)
+
+
+def test_skip_inaccessible_still_fails_when_no_account_is_readable(
+    graph_stub: tuple[_Graph, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, base_url = graph_stub
+    monkeypatch.setenv("META_ACCESS_TOKEN", "EAAe2e")
+    graph.denied = {"111"}
+    day = datetime.now(tz=UTC).date().isoformat()
+    _write_project(tmp_path)
+    _write_config(
+        tmp_path,
+        base_url=base_url,
+        streams="  ads_insights:",
+        start_date=day,
+        extra_params="  skip_inaccessible_accounts: true\n",
+    )
+    result = dtex.run(
+        config="meta_test",
+        project_dir=str(tmp_path),
+        destination_params_override={"path": str(tmp_path / "w.duckdb")},
+    )
+    assert result.status.value != "succeeded"
+    assert "none of the 1 configured ad account" in str(result.error)

@@ -68,6 +68,16 @@ params:
       Comma-separated ad account ids, with or without the `act_` prefix
       (e.g. "1234567890,act_9876543210"). Each stream loops every
       (window, account) pair; every record carries its account_id.
+  skip_inaccessible_accounts:
+    type: bool
+    default: false
+    description: >-
+      When true, an ad account the token cannot read (Graph error 200/10,
+      "grant ads_management or ads_read") is logged as a warning and left out
+      of that run instead of failing it; every other account loads normally,
+      and the account is picked up by the first run after access is granted.
+      The run still fails when NO account is readable (a token problem). Off
+      by default: a listed account that cannot be read stays a hard error.
   start_date:
     type: string
     required: true

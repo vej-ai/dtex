@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 _COL_RE = re.compile(r"^[A-Za-z]{1,3}$")
 _CELL_RE = re.compile(r"^([A-Za-z]{0,3})(\d*)$")
@@ -252,6 +252,25 @@ def parse_list(text: str) -> list[str]:
     return [p.strip() for p in (text or "").split(",") if p.strip()]
 
 
+_GOOGLE_LINK_HOSTS = frozenset({"docs.google.com", "drive.google.com"})
+
+
+def _parse_google_link(text: str) -> ParseResult | None:
+    """``text`` parsed as a Google Docs/Drive link, or None when it is not a link.
+
+    A link is recognised by its host, never by a substring, so
+    ``https://evil.example/?docs.google.com`` is refused rather than mined
+    for an ID. A scheme-less ``docs.google.com/...`` is accepted.
+    """
+    if "://" not in text and "/" not in text:
+        return None
+    parsed = urlparse(text if "://" in text else f"https://{text}")
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or host not in _GOOGLE_LINK_HOSTS:
+        raise ValueError(f"{text!r} is not a docs.google.com or drive.google.com link")
+    return parsed
+
+
 def parse_spreadsheet_id(value: str) -> str:
     """A spreadsheet link or a bare spreadsheet ID → the ID.
 
@@ -262,8 +281,8 @@ def parse_spreadsheet_id(value: str) -> str:
     text = (value or "").strip()
     if not text:
         raise ValueError("google_sheets: `spreadsheet` is required (a link or an ID)")
-    if "://" in text or text.startswith("docs.google.com") or text.startswith("drive.google.com"):
-        parsed = urlparse(text if "://" in text else f"https://{text}")
+    parsed = _parse_google_link(text)
+    if parsed is not None:
         match = _SPREADSHEET_PATH_RE.search(parsed.path) or re.search(
             r"/file/d/([A-Za-z0-9_-]+)", parsed.path
         )
@@ -288,8 +307,8 @@ def parse_folder_id(value: str) -> str:
     text = (value or "").strip()
     if not text:
         raise ValueError("google_drive: `folder` is required (a link or a folder ID)")
-    if "://" in text or text.startswith("drive.google.com"):
-        parsed = urlparse(text if "://" in text else f"https://{text}")
+    parsed = _parse_google_link(text)
+    if parsed is not None:
         match = _FOLDER_PATH_RE.search(parsed.path)
         if match is not None:
             return match.group(1)

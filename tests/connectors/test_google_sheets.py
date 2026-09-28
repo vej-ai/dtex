@@ -109,7 +109,17 @@ def test_spreadsheet_link_or_id_parses_to_the_id(value: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "value", ["", "https://example.com/x", "not an id!", "https://docs.google.com/document/"]
+    "value",
+    [
+        "",
+        "https://example.com/x",
+        "not an id!",
+        "https://docs.google.com/document/",
+        f"https://evil.example/docs.google.com/spreadsheets/d/{SID}",
+        f"https://evil.example/?next=drive.google.com&id={SID}",
+        f"https://docs.google.com.evil.example/spreadsheets/d/{SID}",
+        f"ftp://docs.google.com/spreadsheets/d/{SID}",
+    ],
 )
 def test_spreadsheet_parse_rejects_garbage(value: str) -> None:
     with pytest.raises(ValueError):

@@ -1,0 +1,97 @@
+# Google Sheets source — every tab of a spreadsheet as its own stream/table.
+#
+# The one declared stream, `tabs`, is a TEMPLATE (`discover: true`): at run
+# time the connector lists the spreadsheet's tabs and the engine expands the
+# template into one stream per tab, named after the tab (docs/03 §2.2.3). A
+# config then selects tabs like any other streams:
+#
+#   streams: all                       # every tab
+#   streams:                           # or name them (slugified tab titles)
+#     orders:
+#     refunds:
+#       params: {range: "A2:N10"}      # per-tab knobs
+#
+# Sheets expose no change cursor, so each tab is a full refresh: `replace`
+# swaps in the tab as it is now on every run.
+#
+# Auth: Application Default Credentials by default, or a service-account key
+# (credentials_path / credentials_json) — the same knobs as the BigQuery
+# destination. No `secrets:` block: a key is either a file on disk or a
+# ${env.X} / secret:// REFERENCE in `credentials_json`, resolved at run time,
+# so ADC users need no secret at all.
+name: google_sheets
+kind: source
+version: "1.0.0"
+summary: Read every tab (or chosen tabs / ranges) of a Google Sheets spreadsheet, one table per tab.
+tags: [google, sheets, spreadsheet, gsheets]
+
+params:
+  spreadsheet:
+    type: string
+    required: true
+    description: >-
+      The spreadsheet — a link (https://docs.google.com/spreadsheets/d/<id>/...)
+      or the bare spreadsheet ID. A #gid in the link is ignored; use `tabs`.
+  tabs:
+    type: string
+    default: ""
+    description: >-
+      Comma-separated tabs to read (default: all). Each entry is a tab title,
+      a quoted title ('Q1, final'), or gid=<n>, optionally with an A1 range:
+      "Orders!A2:N, Refunds!A2:N10, gid=123".
+  range:
+    type: string
+    default: ""
+    description: >-
+      A1 range without a sheet name applied to the tab(s) — "A2:N" (row 2 to
+      the last row, columns A..N) or "A2:N10". Empty = the tab's used area.
+      A range given in `tabs` wins for that tab.
+  header_row:
+    type: int
+    default: null
+    description: >-
+      Sheet row number holding the column names. Unset = the first non-empty
+      row of the range; 0 = no header row (names from `columns`, else
+      column_<n>). May lie above the range (range A5:N, header_row 1).
+  columns:
+    type: string
+    default: ""
+    description: Comma-separated column names, left to right; override the header row's names.
+  parse_dates:
+    type: bool
+    default: true
+    description: >-
+      Type date / date-time / time cells from their number format (one extra
+      format-only API read per tab). Off = those cells land as Sheets serial numbers.
+  table_prefix:
+    type: string
+    default: ""
+    description: Prefix for every destination table name (e.g. "gsheet_budget_").
+  batch_size:
+    type: int
+    default: 1000
+    description: Records per yielded batch.
+  auth_type:
+    type: string
+    default: "auto"
+    description: >-
+      "auto" (a service account when a key is configured, else ADC), "oauth"
+      (Application Default Credentials) or "service_account".
+  credentials_path:
+    type: string
+    default: ""
+    description: Path to a service-account JSON key file.
+  credentials_json:
+    type: string
+    default: ""
+    description: >-
+      A REFERENCE to a service-account key's JSON — ${env.VAR} or a secret://
+      URL (docs/08 §3). Never the key itself.
+
+streams:
+  # The template. Every discovered tab inherits this entry; its name and table
+  # come from the tab (plus `table_prefix`). The schema is inferred per tab.
+  - name: tabs
+    table: tabs
+    discover: true
+    write_disposition: replace

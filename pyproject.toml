@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dtex"
-version = "0.18.0"
+version = "0.19.0"
 description = "dtex (data extraction tool) — an open-source Python EL tool: pipelines as configs, connectors as folders, CLI-first."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -49,6 +49,11 @@ dependencies = [
     "google-cloud-bigquery>=3.20",
     "google-cloud-storage>=2.10",
     "pyarrow>=15",
+    # google_sheets / google_drive sources — google-auth signs the Sheets and
+    # Drive API calls (already present through the GCP SDKs above; declared
+    # because the sources import it directly), openpyxl reads .xlsx files.
+    "google-auth>=2.20",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -127,6 +132,12 @@ no_implicit_optional = true
 # pre-2.3 behavior, restored explicitly.
 [[tool.mypy.overrides]]
 module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+# openpyxl (google_drive's XLSX reader) ships no type information either; the
+# import is lazy and used as Any, the same treatment as pyarrow above.
+[[tool.mypy.overrides]]
+module = ["openpyxl", "openpyxl.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

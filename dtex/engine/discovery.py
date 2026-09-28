@@ -394,6 +394,21 @@ def validate_connector(loaded: LoadedConnector) -> None:
                 reg = registry.stream(name)
                 if reg is not None and reg.inject is None:  # pragma: no cover
                     problems.append(f"stream {name!r} has no recorded injectable list")
+            # Discovered-stream templates (docs/03 §2.2.3): every
+            # `discover: true` entry needs exactly one @discover hook, and a
+            # hook must expand a declared template — never an orphan.
+            templates = {s.name for s in manifest.streams if s.discover}
+            hooked = set(registry.discoveries)
+            for missing in sorted(templates - hooked):
+                problems.append(
+                    f"stream {missing!r} is declared with discover: true but has no "
+                    f"matching @discover(stream={missing!r}) hook (docs/03 §3.6)"
+                )
+            for orphan in sorted(hooked - templates):
+                problems.append(
+                    f"@discover(stream={orphan!r}) has no matching streams[] entry "
+                    f"with discover: true in register.yaml (docs/03 §3.6)"
+                )
     else:  # ConnectorKind.DESTINATION
         if registry.kind is not ConnectorKind.DESTINATION:
             problems.append(

@@ -401,7 +401,10 @@ def list_components(
             ]
         src_rows: list[list[str]] = []
         for s in sources:
-            stream_names = ", ".join(x.name for x in s.manifest.streams) or "-"
+            # A `discover: true` template expands at run time (docs/03 §2.2.3).
+            stream_names = ", ".join(
+                f"{x.name} (discovered)" if x.discover else x.name for x in s.manifest.streams
+            ) or "-"
             src_rows.append(
                 [
                     s.name,

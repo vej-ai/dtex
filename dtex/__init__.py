@@ -39,6 +39,7 @@ from dtex.engine import run, run_tag
 from dtex.registry import (
     Connector,
     destination,
+    discover,
     resource,
     stream,
     stream_method,
@@ -56,6 +57,7 @@ from dtex.types import (
     ConnectorKind,
     Cursor,
     CursorType,
+    DiscoveredStream,
     Field,
     FieldMode,
     FieldType,
@@ -115,6 +117,7 @@ __all__ = [
     "stream",
     "resource",
     "destination",
+    "discover",
     "Connector",
     "stream_method",
     # Secret-resolver plugin surface (dtex.secrets — stage 9a, docs/08 §3)
@@ -129,6 +132,7 @@ __all__ = [
     "ConnectorKind",
     "Cursor",
     "CursorType",
+    "DiscoveredStream",
     "Field",
     "FieldMode",
     "FieldType",

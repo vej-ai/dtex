@@ -1,0 +1,107 @@
+# Google Drive source — CSV / XLSX / native Google Sheets files in a Drive
+# folder (My Drive or a shared drive), unioned into one table per stream.
+#
+# Modelled on the `filesystem` source: `folder` + `glob` pick the files, the
+# stream is incremental BY FILE on the synthetic `_dtex_file_cursor` field
+# (`<modifiedTime>|<fileId>`), and a new or modified file is loaded whole.
+# Several tables from one folder = one stream per glob in a project-local copy
+# of this connector (the README shows the three-line source.py).
+#
+# Auth: Application Default Credentials by default, or a service-account key —
+# the same params as the google_sheets source. The folder must be shared with
+# the identity (a service account's email, for example).
+name: google_drive
+kind: source
+version: "1.0.0"
+summary: Load CSV / XLSX / Google Sheets files from a Google Drive folder (incl. shared drives), incrementally by file.
+tags: [google, drive, csv, xlsx, spreadsheet, files]
+
+params:
+  folder:
+    type: string
+    required: true
+    description: >-
+      The folder — a link (https://drive.google.com/drive/folders/<id>) or the
+      bare folder ID. Shared-drive folders work.
+  glob:
+    type: string
+    default: "*"
+    description: >-
+      Pattern matched against each file NAME (fnmatch, case-sensitive):
+      "orders_*.csv", "*.xlsx", "report ????-??.csv".
+  recursive:
+    type: bool
+    default: false
+    description: Also read files in sub-folders (at any depth).
+  format:
+    type: string
+    default: "auto"
+    description: >-
+      "auto" (by extension, then Drive mimeType; other files are skipped) or
+      one of csv / xlsx / google_sheets to read every matched file that way.
+      A native Google Sheet is always read as google_sheets.
+  sheet:
+    type: string
+    default: ""
+    description: >-
+      XLSX / Google Sheets: which sheet (tab) to read — its name, or its
+      1-based position. Empty = the first.
+  range:
+    type: string
+    default: ""
+    description: A1 range within the sheet / CSV — "A2:N" or "A2:N10". Empty = the used area.
+  header_row:
+    type: int
+    default: null
+    description: >-
+      Row number holding the column names. Unset = the first non-empty row of
+      the range; 0 = no header row (names from `columns`, else column_<n>).
+  columns:
+    type: string
+    default: ""
+    description: Comma-separated column names, left to right; override the header row's names.
+  csv_delimiter:
+    type: string
+    default: ","
+    description: CSV field separator (.tsv files default to a tab).
+  parse_dates:
+    type: bool
+    default: true
+    description: Google Sheets files only — type date / time cells from their number format.
+  batch_size:
+    type: int
+    default: 1000
+    description: Records per yielded batch.
+  auth_type:
+    type: string
+    default: "auto"
+    description: >-
+      "auto" (a service account when a key is configured, else ADC), "oauth"
+      (Application Default Credentials) or "service_account".
+  credentials_path:
+    type: string
+    default: ""
+    description: Path to a service-account JSON key file.
+  credentials_json:
+    type: string
+    default: ""
+    description: >-
+      A REFERENCE to a service-account key's JSON — ${env.VAR} or a secret://
+      URL (docs/08 §3). Never the key itself.
+
+streams:
+  # One stream: every file under `folder` matching `glob`. The cursor field
+  # is synthetic — attached by the source to every record — and a string
+  # whose order is the files' change order (see source.py). `ordered: true`:
+  # files are read in cursor order and the cursor is observed only after a
+  # file's last record, so a mid-stream state flush never skips a file.
+  # Schema is inferred; a declared schema must include the three _dtex_file_*
+  # columns and _dtex_row_number.
+  - name: files
+    table: files
+    write_disposition: append
+    incremental:
+      cursor_field: _dtex_file_cursor
+      cursor_type: string
+      ordered: true
+      initial_value: ""

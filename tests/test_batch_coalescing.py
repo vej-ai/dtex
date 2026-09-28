@@ -155,3 +155,22 @@ def test_engine_resolves_the_hook() -> None:
     cfg = Config(params={"min_batch_rows": 750})
     assert _min_batch_rows({}, cfg) == 0
     assert _min_batch_rows({"min_batch_rows": bq.min_batch_rows}, cfg) == 750
+
+
+def test_an_empty_snapshot_still_reaches_write_batch() -> None:
+    """A replace stream whose source yields one empty batch must still be written
+    (the destination truncates on it) when coalescing is on — as it is without."""
+
+    def gen(config: Config, state: Any, log: Any) -> Iterator[Batch]:
+        yield []
+
+    stream_def = StreamDef(
+        name="snapshot", table="snapshot", write_disposition=WriteDisposition.REPLACE
+    )
+    for threshold in (0, 1000):
+        events: list[tuple[str, Any]] = []
+        _run_one_stream(
+            stream_def, _make_source(gen, name="snapshot"), _hooks_with_log(events),
+            object(), _run_config(), _pipeline(), None, LOG, min_batch_rows=threshold,
+        )
+        assert _writes(events) == [0], threshold

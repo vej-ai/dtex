@@ -83,6 +83,28 @@ streams:
 `streams: all` and per-stream entries are **mutually exclusive** — use
 one shape or the other.
 
+### Discovered streams (e.g. `google_sheets` tabs)
+
+Some sources find their streams at run time — `google_sheets` has one
+stream per spreadsheet tab (the tab title in snake_case). `dtex list`
+shows such a source's template as `<name> (discovered)`. Select them like
+any stream: `streams: all` runs every discovered stream, and the mapping
+names discovered streams (with per-stream `params`, e.g. a tab's `range`).
+Names are known only after discovery, so a misspelt name fails when the
+run starts, with the list of streams discovery found. Prefer narrowing
+with the source's own params (`tabs: "Orders!A2:N, Refunds"`) over
+listing every tab under `streams:`.
+
+```yaml
+name: finance_sheet
+source: google_sheets
+destination: bigquery
+params:
+  spreadsheet: https://docs.google.com/spreadsheets/d/<id>/edit
+  tabs: "Orders!A2:N, Refunds"
+streams: all
+```
+
 ## Per-stream knobs
 
 ### `mode: incremental | full_refresh`

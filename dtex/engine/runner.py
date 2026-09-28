@@ -78,6 +78,7 @@ from dtex.types import (
     Config,
     Cursor,
     CursorType,
+    DiscoveredStream,
     Field,
     FieldType,
     Incremental,
@@ -614,6 +615,85 @@ def _validate_streams_block(
                 )
 
 
+def _has_stream_templates(source: disc.LoadedConnector) -> bool:
+    """Whether the source declares any ``discover: true`` stream template."""
+    return any(sd.discover for sd in source.manifest.streams)
+
+
+def _expand_stream_templates(
+    source: disc.LoadedConnector, source_config: Config, log: Any
+) -> disc.LoadedConnector:
+    """Replace each ``discover: true`` template with the streams its hook finds.
+
+    docs/03 §2.2.3. Each template's ``@discover`` hook is called once with the
+    connector-level Config; every :class:`DiscoveredStream` it returns becomes
+    a :class:`StreamDef` copied from the template (disposition, primary key,
+    incremental block, schema, partitioning, contract) with its own ``name``,
+    ``table`` and ``context``. Declared streams keep their place; discovered
+    streams take the template's place, in the order the hook returned them.
+
+    A discovered name that collides with a declared stream or with another
+    discovered stream is a hard error: silently merging two objects into one
+    table (or one ``_dtex_state`` row) is exactly the failure mode the engine
+    exists to prevent. So is an expansion that leaves the source with no
+    streams at all.
+    """
+    declared_names = {sd.name for sd in source.manifest.streams if not sd.discover}
+    expanded: list[StreamDef] = []
+    seen: dict[str, str] = {}
+    for sd in source.manifest.streams:
+        if not sd.discover:
+            expanded.append(sd)
+            continue
+        hook = source.registry.discovery(sd.name)
+        if hook is None:  # pragma: no cover — validate_connector caught it.
+            raise EngineError(f"stream template {sd.name!r} has no @discover hook")
+        found = hook.func(**compute_injection(hook.func, {"config": source_config, "log": log}))
+        names: list[str] = []
+        for item in found or ():
+            if not isinstance(item, DiscoveredStream):
+                raise EngineError(
+                    f"@discover(stream={sd.name!r}) must return DiscoveredStream "
+                    f"objects, got {type(item).__name__}"
+                )
+            if item.name in declared_names:
+                raise EngineError(
+                    f"@discover(stream={sd.name!r}) found a stream named "
+                    f"{item.name!r}, which collides with a declared stream of "
+                    f"source {source.manifest.name!r}"
+                )
+            if item.name in seen:
+                raise EngineError(
+                    f"@discover(stream={sd.name!r}) found two streams named "
+                    f"{item.name!r} (templates {seen[item.name]!r} and {sd.name!r}); "
+                    f"discovered stream names must be unique"
+                )
+            seen[item.name] = sd.name
+            names.append(item.name)
+            expanded.append(
+                replace(
+                    sd,
+                    name=item.name,
+                    table=item.table or item.name,
+                    discover=False,
+                    discovered_from=sd.name,
+                    context=dict(item.context),
+                )
+            )
+        log.info(
+            "stream template %r: discovered %d stream(s)%s",
+            sd.name,
+            len(names),
+            f": {', '.join(names)}" if names else "",
+        )
+    if not expanded:
+        raise EngineError(
+            f"source {source.manifest.name!r}: stream discovery found no streams to run"
+        )
+    manifest = replace(source.manifest, streams=tuple(expanded))
+    return replace(source, manifest=manifest)
+
+
 def _short_form_compatible(
     column: str, stream_def: StreamDef, schema: Schema
 ) -> bool:
@@ -1015,7 +1095,8 @@ def _run_one_stream(
         stream_def = replace(
             stream_def, schema=_merge_configured_schema(stream_def.schema, configured_schema)
         )
-    registration = source.registry.stream(stream_def.name)
+    # A discovered stream (docs/03 §2.2.3) runs its template's @stream function.
+    registration = source.registry.stream(stream_def.discovered_from or stream_def.name)
     if registration is None:  # pragma: no cover — validate_connector caught it.
         raise EngineError(f"stream {stream_def.name!r} has no registered @stream function")
 
@@ -1301,14 +1382,20 @@ def _run_one_stream(
             # the rows that are durable. Heartbeats keep the lease alive while
             # the buffer fills (they self-throttle).
             pending: list[dict[str, Any]] = []
+            wrote_any = False
             for batch in itertools.chain((first_batch,), batches):
                 pending.extend(batch)
                 if len(pending) >= min_batch_rows:
                     _load_batch(pending)
+                    wrote_any = True
                     pending = []
                 elif heartbeat is not None:
                     heartbeat()
-            if pending:
+            # A stream that yielded only empty batches still reaches
+            # write_batch once, as it does without coalescing: a `replace`
+            # destination truncates on an empty batch (an empty snapshot is a
+            # snapshot), so swallowing it would leave the previous rows behind.
+            if pending or not wrote_any:
                 _load_batch(pending)
 
         cursor_after = cursor_before
@@ -2130,7 +2217,12 @@ def run(
         # hits), and that is the "silent
         # drop" pattern the rest of the codebase rejects (unknown YAML keys
         # are hard errors, unknown configs list known names).
-        _validate_streams_block(pipeline, source)
+        # A source with discovered-stream templates (docs/03 §2.2.3) only
+        # knows its stream names after the discovery hooks run, which needs
+        # the resolved Config — so its validation waits until then.
+        has_templates = _has_stream_templates(source)
+        if not has_templates:
+            _validate_streams_block(pipeline, source)
 
         # -- Stage 2: RESOLVE -----------------------------------------------
         source_config = cfg.build_source_config(
@@ -2158,6 +2250,14 @@ def run(
         # short / repeated values, so calling ``add`` twice is harmless.
         redactor.add(source_config.secrets.values())
         redactor.add(dest_config.secrets.values())
+
+        # Expand discovered-stream templates into concrete streams (docs/03
+        # §2.2.3) — from here on `source.manifest.streams` is the run's real
+        # stream list, so every later step (selection, per-stream params,
+        # leasing, result ordering) treats a discovered stream like any other.
+        if has_templates:
+            source = _expand_stream_templates(source, source_config, log)
+            _validate_streams_block(pipeline, source)
 
         # The config's `streams:` block defines the in-scope stream set
         # for this pipeline. CLI --select NARROWS further (intersection):

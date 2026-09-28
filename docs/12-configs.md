@@ -108,6 +108,8 @@ streams: all
 
 The two shapes are mutually exclusive. `streams: all` plus per-stream entries is rejected; an empty mapping (`streams: {}`) is rejected with `'streams' must not be empty`.
 
+**Discovered streams.** A source whose streams are found at run time (a `discover: true` template — docs/03 §2.2.3, e.g. `google_sheets`, one stream per spreadsheet tab) is selected the same way: `streams: all` runs everything discovered, and the explicit mapping names discovered streams (with per-stream `params`) exactly like declared ones. Because the names are only known after discovery, a typo is reported when the run starts, listing the streams discovery found.
+
 Per-stream knobs:
 
 | knob | type | meaning |

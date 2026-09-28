@@ -1213,6 +1213,20 @@ class StreamDef:
     # NOTE in :mod:`dtex.engine.runner`)."""
     params: Mapping[str, ParamSpec] = field(default_factory=dict)
     schema_contract: SchemaContract = SchemaContract.EVOLVE
+    discover: bool = False
+    """``discover: true`` in ``register.yaml`` marks this entry as a stream
+    *template*: at run time the connector's ``@discover(stream=<name>)`` hook
+    expands it into zero or more concrete streams (one per spreadsheet tab, for
+    example), each inheriting every other key of this entry. See docs/03 §2.2.3
+    and :class:`DiscoveredStream`."""
+    discovered_from: str | None = None
+    """Runtime-only: the template stream a discovered stream was expanded from
+    (``None`` on every declared stream). The engine runs a discovered stream
+    with its template's ``@stream`` function. Never parsed from YAML."""
+    context: Mapping[str, Any] = field(default_factory=dict)
+    """Runtime-only: the discovery hook's per-stream context (e.g. the tab's
+    id and title), read by the template's ``@stream`` function through the
+    injected ``stream_def``. Empty on every declared stream."""
 
     def __post_init__(self) -> None:
         """Enforce stream-level integrity rules — docs/03 §7 step 4.
@@ -1257,6 +1271,7 @@ class StreamDef:
             "gaql",
             "params",
             "schema_contract",
+            "discover",
         }
         unknown = set(data) - known
         if unknown:
@@ -1327,7 +1342,48 @@ class StreamDef:
             schema_contract=SchemaContract.parse(
                 data.get("schema_contract", SchemaContract.EVOLVE)
             ),
+            discover=_parse_discover_flag(name, data.get("discover", False)),
         )
+
+
+def _parse_discover_flag(stream_name: str, value: Any) -> bool:
+    """Validate a stream's ``discover:`` key — a YAML boolean, nothing else."""
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"stream {stream_name!r}: 'discover' must be a boolean, got {value!r}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class DiscoveredStream:
+    """One concrete stream a ``@discover`` hook found at run time — docs/03 §2.2.3.
+
+    Returned (as an iterable) by a connector's ``@discover(stream=<template>)``
+    hook. The engine turns each into a :class:`StreamDef` that copies the
+    template's declaration (disposition, primary key, incremental block,
+    schema, …) and overrides only:
+
+    * ``name`` — the stream name: what a config's ``streams:`` block and
+      ``--select`` name, and the ``_dtex_state`` key. Must be stable across
+      runs for the same underlying object, or state and table names drift.
+    * ``table`` — the destination table; defaults to ``name``.
+    * ``context`` — free-form, JSON-able facts the template's ``@stream``
+      function needs to read this particular stream (``stream_def.context``).
+    """
+
+    name: str
+    table: str | None = None
+    context: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject an empty or non-string stream name."""
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(f"a discovered stream needs a non-empty name, got {self.name!r}")
+        if self.table is not None and (not isinstance(self.table, str) or not self.table):
+            raise ValueError(
+                f"discovered stream {self.name!r}: table must be a non-empty string"
+            )
 
 
 @dataclass(frozen=True)

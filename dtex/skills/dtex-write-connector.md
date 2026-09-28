@@ -283,6 +283,17 @@ Stripe-specific naming today; future dual-surface connectors should
 either reuse it (if they have similar SQL semantics) or add a parallel
 marker (`bulk:`, `soql:`) following the same opt-in shape.
 
+## Discovered streams — when the stream list is data
+
+When the streams are whatever the source holds today (every tab of a
+spreadsheet), don't hard-code a list. Declare ONE template entry with
+`discover: true` and add a `@discover(stream="<template>")` hook that returns
+`dtex.DiscoveredStream(name, table, context)` objects; the template's
+`@stream` function then runs once per discovered stream and reads
+`stream_def.context` to know which one. Names must be stable across runs
+(derive them from a durable title/id) and unique. The baked `google_sheets`
+connector is the reference implementation; the contract is docs/03 §2.2.3.
+
 ## The `client.py` pattern
 
 ```python

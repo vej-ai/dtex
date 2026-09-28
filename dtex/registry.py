@@ -89,8 +89,11 @@ __all__ = [
     "STREAM_INJECTABLES",
     "StreamRegistration",
     "active_registry",
+    "DISCOVER_INJECTABLES",
+    "DiscoveryRegistration",
     "compute_injection",
     "destination",
+    "discover",
     "registration_scope",
     "resource",
     "stream",
@@ -128,6 +131,14 @@ these; declaring anything else is a discovery-time error (docs/03 §7 rule 8).
 STREAM_METHOD_INJECTABLES: frozenset[str] = STREAM_INJECTABLES - {"config"}
 """Injectable parameter names for a ``@stream_method`` — ``@stream`` minus ``config``."""
 
+
+DISCOVER_INJECTABLES: frozenset[str] = frozenset({"config", "log"})
+"""The parameter names the engine injects into a ``@discover`` hook — docs/03 §3.6.
+
+A discovery hook runs once per run, before any stream, with the connector-level
+resolved :class:`dtex.Config` (no per-stream layer — the streams do not exist
+yet) and the run logger. It has no state, cursor or stream_def of its own.
+"""
 
 # Function-attribute names used to stamp metadata onto decorated functions.
 # Dunder-style so they never collide with an author's own attributes and are
@@ -325,6 +336,22 @@ class StreamRegistration:
 
 
 @dataclass(frozen=True)
+class DiscoveryRegistration:
+    """One registered ``@discover`` hook — docs/03 §3.6.
+
+    Binds a ``register.yaml`` stream template (a ``streams[]`` entry with
+    ``discover: true``) to the function that expands it at run time.
+    """
+
+    stream: str
+    """The template stream's name — a ``streams[].name`` with ``discover: true``."""
+    func: Callable[..., Any]
+    """The decorated hook. Directly callable; ``functools.wraps`` metadata intact."""
+    inject: tuple[str, ...]
+    """The injectable parameter names the function declares, in signature order."""
+
+
+@dataclass(frozen=True)
 class DestinationHook:
     """One registered ``@destination.*`` hook — docs/03 §3.4, docs/05 §1.
 
@@ -455,6 +482,8 @@ class ConnectorRegistry:
     """Registered destination hooks, keyed by hook name."""
     connector_classes: list[type[Connector]] = field(default_factory=list)
     """:class:`Connector` subclasses defined in this connector (the §4 escape hatch)."""
+    discoveries: dict[str, DiscoveryRegistration] = field(default_factory=dict)
+    """Registered ``@discover`` hooks, keyed by the template stream they expand."""
 
     @property
     def kind(self) -> ConnectorKind | None:
@@ -501,6 +530,20 @@ class ConnectorRegistry:
             )
         self.streams[reg.name] = reg
 
+    def add_discovery(self, reg: DiscoveryRegistration) -> None:
+        """Record a ``@discover`` hook; reject a second hook for one template.
+
+        A discovery hook belongs to a source, so it shares the source-kind
+        guard with ``@stream``.
+        """
+        self._guard_kind(ConnectorKind.SOURCE)
+        if reg.stream in self.discoveries:
+            raise ValueError(
+                f"connector {self.connector!r}: stream template {reg.stream!r} has "
+                f"two @discover hooks; each template may have exactly one"
+            )
+        self.discoveries[reg.stream] = reg
+
     def add_hook(self, hook: DestinationHook) -> None:
         """Record a destination hook; reject a duplicate hook — docs/03 §3.4.
 
@@ -533,6 +576,10 @@ class ConnectorRegistry:
     def hook(self, name: str) -> DestinationHook | None:
         """Look up a destination hook by name; ``None`` if absent."""
         return self.hooks.get(name)
+
+    def discovery(self, stream: str) -> DiscoveryRegistration | None:
+        """Look up the ``@discover`` hook for a stream template; ``None`` if absent."""
+        return self.discoveries.get(stream)
 
     @property
     def stream_names(self) -> tuple[str, ...]:
@@ -631,6 +678,66 @@ Identical to ``@stream`` in every respect; provided so authors arriving from
 dlt feel at home. One implementation, exposed under both names — they cannot
 drift apart. The handbook, examples and scaffolding all use ``@stream``.
 """
+
+
+# ---------------------------------------------------------------------------
+# @discover — run-time stream expansion (docs/03 §2.2.3, §3.6)
+# ---------------------------------------------------------------------------
+
+
+def discover(stream: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a function as the run-time expander of a stream template — docs/03 §3.6.
+
+    Some sources cannot know their streams until they look: every tab of a
+    spreadsheet is its own table, and the tabs are whatever the spreadsheet
+    holds today. Such a source declares ONE template entry in ``register.yaml``
+    with ``discover: true`` (its disposition, primary key, incremental block
+    etc. apply to every stream it expands into), implements it with an
+    ordinary ``@stream(name=<template>)`` function, and adds a hook::
+
+        @discover(stream="tabs")
+        def tabs_in_spreadsheet(config, log) -> list[DiscoveredStream]:
+            ...
+
+    The engine calls the hook once per run, after params and secrets resolve
+    and before any stream runs, and replaces the template with one stream per
+    returned :class:`~dtex.types.DiscoveredStream`. Each discovered stream is
+    selectable by name in a config's ``streams:`` block (with per-stream
+    ``params``), gets its own ``_dtex_state`` row and its own table, and runs
+    the template's ``@stream`` function with ``stream_def.name`` /
+    ``stream_def.context`` identifying which one it is.
+
+    The hook may declare ``config`` and ``log`` (:data:`DISCOVER_INJECTABLES`).
+    Like ``@stream`` it returns the function unchanged and directly callable.
+    """
+    if not isinstance(stream, str) or not stream:
+        raise TypeError(
+            "@discover requires a non-empty string 'stream' naming a register.yaml "
+            "stream template (a streams[] entry with discover: true) — write "
+            "@discover(stream=\"...\")"
+        )
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        if not callable(func):
+            raise TypeError(f"@discover(stream={stream!r}) must decorate a callable")
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return func(*args, **kwargs)
+
+        inject = _injectable_params(func, skip_self=False)
+        _validate_injectables(func, inject, DISCOVER_INJECTABLES, what="@discover hook")
+        wrapper.__dtex_inject__ = inject  # type: ignore[attr-defined]
+        wrapper.__dtex_discovers__ = stream  # type: ignore[attr-defined]
+
+        _register_into_active(
+            lambda reg: reg.add_discovery(
+                DiscoveryRegistration(stream=stream, func=wrapper, inject=inject)
+            )
+        )
+        return wrapper
+
+    return decorator
 
 
 # ---------------------------------------------------------------------------

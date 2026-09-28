@@ -113,6 +113,7 @@ Each entry in `streams` declares one output table.
 | `schema` | list[Field] | No | `null` (infer) | Explicit column definitions. See §2.2.1. |
 | `partition_by` | string \| mapping | No | `null` | Physical-partition declaration. Short form: a bare column name (`partition_by: created_date`) — defaults to `TIME` partitioning at `DAY` granularity. Long form: a mapping with `field` / `type` (`time` / `range` / `ingestion`) / optional `granularity` / optional `range`. See [05 §3.3](./05-destinations-and-state.md#33-partitioning). A per-pipeline `partition_overrides:` block in a config can override this on a per-stream basis. Honored by BigQuery; ignored by destinations that lack native partitioning (DuckDB). |
 | `params` | map[string → ParamSpec] | No | `{}` | Stream-scoped params, merged over connector-level `params`. |
+| `discover` | bool | No | `false` | Marks the entry as a stream **template** that a `@discover` hook expands at run time into one stream per object found (every tab of a spreadsheet). See §2.2.3. |
 
 #### The `incremental` block
 
@@ -205,6 +206,62 @@ Three deliberate properties:
   opaque sequence as a Unix timestamp; guessing would invent an age.
 * **It is advisory.** The engine's behaviour does not change. A threshold that
   is wrong makes an alert wrong, never a run.
+
+#### 2.2.3 Discovered streams — `discover: true`
+
+Most sources know their streams when they are written: ShipHero has
+shipments and orders, Stripe has charges and invoices. Some cannot know until
+they look. Every tab of a spreadsheet is its own table, and the tabs are
+whatever the spreadsheet holds today. Such a source declares one **template**
+entry and a discovery hook instead of guessing a fixed list:
+
+```yaml
+# register.yaml
+streams:
+  - name: tabs              # the template
+    table: tabs
+    discover: true
+    write_disposition: replace
+```
+
+```python
+# source.py
+from dtex import DiscoveredStream, discover, stream
+
+@discover(stream="tabs")
+def find_tabs(config, log):
+    return [
+        DiscoveredStream(name="orders", table="orders", context={"sheet_id": 0}),
+        DiscoveredStream(name="refunds", table="refunds", context={"sheet_id": 17}),
+    ]
+
+@stream(name="tabs")
+def tabs(config, stream_def):
+    sheet_id = stream_def.context["sheet_id"]   # which tab this run of the function is for
+    ...
+```
+
+At run time — after params and secrets resolve, before any stream runs — the
+engine calls the hook once and replaces the template with one stream per
+returned `DiscoveredStream`. Each copies every other key of the template
+(disposition, primary key, `incremental`, `schema`, partitioning, contract)
+and gets its own:
+
+* **name** — what a config's `streams:` block and `--select` refer to, and the
+  `_dtex_state` key. It must be stable across runs for the same object, or
+  the object's table and cursor drift. A source derives it from something
+  durable (a tab's title, falling back to its id).
+* **table** — defaults to the name.
+* **context** — JSON-able facts the template's `@stream` function reads from
+  `stream_def.context` to know which object it is extracting.
+
+From there a discovered stream is an ordinary stream: `streams: all` runs
+every discovered stream; an explicit `streams:` mapping names them and may give
+each its own `params` (docs/12 §3.1); a name the hook did not return is the
+usual hard error, listing the names it did return. Discovered names must be
+unique and must not collide with a declared stream — the engine fails the run
+rather than merge two objects into one table. `dtex list` shows a template as
+`<name> (discovered)`; `dtex state set` works only on declared streams.
 
 ### 2.3 The source-to-destination binding lives in a config
 
@@ -659,6 +716,20 @@ after batches are durably loaded — never mid-batch in a way that could lose
 data. Because state lives with the data, a fresh checkout of a project resumes
 correctly with zero local files.
 
+### 3.6 `@discover` — expanding a stream template
+
+```python
+@discover(stream="tabs")            # names a streams[] entry with discover: true
+def find_tabs(config, log) -> list[DiscoveredStream]: ...
+```
+
+Runs once per run, before any stream (§2.2.3). It may declare `config` (the
+connector-level resolved `Config` — no per-stream layer, the streams do not
+exist yet) and `log`; nothing else is injectable. It returns an iterable of
+`dtex.DiscoveredStream(name, table=None, context={})`. Each template needs
+exactly one hook and each hook exactly one template (§7 rule 7). The
+template's `@stream` function runs once per discovered stream.
+
 ## 4. The class-based escape hatch
 
 The decorator style covers the overwhelming majority of connectors. For
@@ -784,7 +855,8 @@ Then it imports the Python and validates the **code ↔ manifest** binding:
 
 7. **Decorator coverage** — every `streams[].name` has exactly one matching
    `@stream`/`@stream_method`; every `@stream` has a manifest entry. An orphan on
-   either side is an error.
+   either side is an error. Likewise every `discover: true` template has exactly
+   one `@discover` hook and every hook names a template (§2.2.3).
 8. **Signature check** — each decorated function's parameters are all drawn from
    its injectable set (`config`, `state`, `cursor`, `log` for `@stream`; the
    hook-specific arguments for each `@destination` hook). An unrecognized

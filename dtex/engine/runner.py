@@ -2311,7 +2311,9 @@ def run(
 
         # -- Stage 3: INIT DEST ---------------------------------------------
         hooks, capabilities = _resolve_destination_hooks(dest)
-        conn = hooks["open"](Config(params=dict(dest_config.params)))
+        conn = hooks["open"](Config(
+            params=dict(dest_config.params), secrets=dict(dest_config.secrets)
+        ))
 
         # -- Stage 4: LOAD STATE --------------------------------------------
         # State is keyed by *source* name, not config name: rerunning under a

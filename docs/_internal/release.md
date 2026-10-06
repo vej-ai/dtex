@@ -90,7 +90,8 @@ import re
 html = render(open('README.md').read())
 assert html is not None, 'README is not valid'
 hrefs = re.findall(r'href=\"([^\"]+)\"', html)
-rel = [h for h in hrefs if not h.startswith('http')]
+# The renderer adds working section anchors; reject relative file links.
+rel = [h for h in hrefs if not h.startswith(('http://', 'https://', '#user-content-'))]
 assert not rel, f'relative links would break on PyPI: {rel}'
 print(f'README ok ({len(hrefs)} hrefs)')"
 

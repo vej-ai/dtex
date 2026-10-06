@@ -89,6 +89,18 @@ _PROFILES_YML_FOOTER = """\
 # default `auth_type: oauth` path uses Application Default Credentials and
 # needs no path at all (see docs/05 §BigQuery / `auth_type`).
 _DESTINATION_PROFILE_BLOCKS: dict[str, str] = {
+    "klaviyo": """\
+
+# Klaviyo event delivery. KLAVIYO_API_KEY is resolved from the environment.
+# backfill=true suppresses metric-triggered flows for historical imports.
+klaviyo:
+  default_target: dev
+  targets:
+    dev:
+      backfill: true
+      state_backend: duckdb
+      state_path: .dtex/klaviyo-state.duckdb
+""",
     "duckdb": """\
 
 # Pre-baked DuckDB destination — zero-config local dev default.
@@ -122,7 +134,7 @@ bigquery:
 # The list of baked destinations the `dtex init --with <name>` flag can
 # scaffold a profile block for. Kept in sync with the bundled connectors
 # under dtex/destinations/.
-BAKED_DESTINATIONS: tuple[str, ...] = ("duckdb", "bigquery")
+BAKED_DESTINATIONS: tuple[str, ...] = ("duckdb", "bigquery", "klaviyo")
 
 
 def render_profiles_yml(destinations: list[str] | None = None) -> str:

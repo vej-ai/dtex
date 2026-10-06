@@ -32,6 +32,19 @@ streams: all       # or a mapping — see below
 Optional top-level keys: `target`, `params`, `destination_params`,
 `schedule`, `tags`.
 
+There is no `ref` or `depends_on` key. Chain dependent configs with an external
+orchestrator that gates on upstream success and completed publication; tag
+sweeps continue on failure and may run concurrently.
+
+The baked `klaviyo` destination accepts append-only event streams with
+`unique_id`, `metric_name`, `time`, and JSON `profile`; optional `properties`
+must also be JSON. Its target requires an explicit boolean `backfill` choice.
+Use a separate persistent delivery state store (`state_backend: duckdb` with
+`state_path`, or `bigquery` with `state_project`, `state_dataset`,
+`state_staging_bucket`, and optional `state_location`). Ephemeral workers need
+remote state. Never share the upstream extraction pipeline's checkpoint store.
+HTTP 202 and loaded-row counts mean API acceptance, not completed processing.
+
 Missing `streams:` is a hard error. Unknown top-level keys (typos like
 `destintion`) are a hard error. The legacy keys `select:` and
 `partition_overrides:` are **removed** — both were subsumed by `streams:`.

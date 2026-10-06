@@ -79,6 +79,7 @@ auth checklist, scope requirements, schema, and known limitations.
 |---|---|
 | [`duckdb`](https://github.com/vej-ai/dtex/blob/main/dtex/destinations/duckdb/README.md) | Zero-config dev default, all 5 capabilities |
 | [`bigquery`](https://github.com/vej-ai/dtex/blob/main/dtex/destinations/bigquery/README.md) | Production warehouse — Parquet-staged via GCS + LOAD jobs, MERGE upserts, cursor-based partitioning |
+| [`klaviyo`](https://github.com/vej-ai/dtex/blob/main/dtex/destinations/klaviyo/README.md) | Bulk event submission with stable identifiers, bounded retries, and separate DuckDB or BigQuery delivery state |
 
 **Engine:** per-stream commit + atomic transactions (rollback on failure),
 state in the destination's `_dtex_state` table, run records in `_dtex_runs`,

@@ -1,0 +1,51 @@
+name: klaviyo
+kind: destination
+version: "1.0.0"
+summary: Submit idempotent events to Klaviyo with durable checkpoints and leases.
+tags: [klaviyo, events, reverse-etl]
+
+params:
+  backfill:
+    type: bool
+    required: true
+    description: Explicitly choose whether to suppress metric-triggered flows for historical imports.
+  api_revision:
+    type: string
+    default: "2026-07-15"
+    description: Pinned Klaviyo API revision.
+  max_attempts:
+    type: int
+    default: 5
+    description: Maximum attempts per request, including the initial attempt (1-10).
+  timeout_seconds:
+    type: float
+    default: 60.0
+    description: HTTP read timeout in seconds (greater than zero, at most 300).
+  state_backend:
+    type: string
+    default: duckdb
+    description: Checkpoint, lease and run-history warehouse (duckdb or bigquery).
+  state_path:
+    type: string
+    default: .dtex/klaviyo-state.duckdb
+    description: Persistent local file for DuckDB state; ephemeral workers must use remote state.
+  state_project:
+    type: string
+    required: false
+    description: BigQuery project for remote delivery state.
+  state_dataset:
+    type: string
+    required: false
+    description: Dedicated BigQuery dataset for delivery state, leases and run history.
+  state_location:
+    type: string
+    default: US
+    description: Location of the BigQuery state dataset.
+  state_staging_bucket:
+    type: string
+    required: false
+    description: Existing bucket required by the shared BigQuery backend's initialization.
+
+secrets:
+  - name: api_key
+    ref: ${env.KLAVIYO_API_KEY}

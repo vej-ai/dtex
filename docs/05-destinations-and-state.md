@@ -119,6 +119,7 @@ dtex ships destinations **inside the `dtex` package**. They are referenced by sh
 | Destination | How it loads | Tier | v1? |
 |---|---|---|---|
 | **DuckDB** | Local `.duckdb` file; `INSERT` / `INSERT ... ON CONFLICT`. Zero-config dev default. | A | **v1** |
+| **Klaviyo** | Append-only bulk event submission. Manages checkpoints, leases and run records in a separate DuckDB or BigQuery store; HTTP acceptance is not transactional delivery. | A | **v1** |
 | **BigQuery** | Batches staged as Parquet to a temp GCS prefix, then `LOAD` job; `replace` uses `WRITE_TRUNCATE` on the first batch then `WRITE_APPEND`; `merge` loads to a per-batch staging table then runs `MERGE INTO ... ON pk`. Declares 4 of 5 capabilities (no `TRANSACTIONAL_LOAD` — see chapter 05 §5.3 and the destination README). | A | **v1** |
 | **Postgres** | `COPY` into a staging table, then `INSERT`/`MERGE` into target. | A | v2 |
 | **Snowflake** | `PUT` Parquet to internal stage, `COPY INTO`, merge via `MERGE`. | A | v2 |
@@ -126,7 +127,11 @@ dtex ships destinations **inside the `dtex` package**. They are referenced by sh
 | **Filesystem (GCS / S3 / local)** | Writes Parquet or JSONL objects under a prefix; one object per batch. | **B** | v2 |
 | **SQLAlchemy (generic)** | Any SQLAlchemy-supported DB via `executemany` / bulk insert. Fallback for long-tail warehouses. | A | v2 |
 
-> **v1 ships DuckDB + BigQuery only.** This keeps the v1 surface honest and testable. The rest are designed now (the interface must accommodate them) but land in v2. See [10 — Roadmap and Scope](./10-roadmap-and-scope.md).
+v1 ships DuckDB, BigQuery and Klaviyo. Klaviyo requires explicit `backfill`
+configuration and stable event identifiers; see its [record and state
+contract](../dtex/destinations/klaviyo/README.md). Other destinations above
+remain planned. Resolved destination secrets are available as `config.secrets`
+inside `open`, and are registered with the engine's log redactor.
 
 ### Tier definitions
 

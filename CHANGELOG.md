@@ -10,6 +10,22 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-10-06
+
+### Added
+
+- Baked Klaviyo destination for append-only event delivery: stable event
+  identifiers, original timestamps, explicit backfill behavior, bounded HTTP
+  retries and request-size limits. Checkpoints, leases and run history use a
+  separate DuckDB or BigQuery state store. Success records API acceptance;
+  asynchronous processing requires separate reconciliation.
+
+### Fixed
+
+- Pass resolved destination secrets into the destination's `open` hook. The
+  engine previously resolved and registered these secrets for redaction but
+  discarded them when initializing the destination.
+
 ## [0.19.0] — 2026-09-29
 
 ### Added
@@ -1488,7 +1504,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/vej-ai/dtex/releases/tag/v0.20.0
 [0.19.0]: https://github.com/vej-ai/dtex/releases/tag/v0.19.0
 [0.18.0]: https://github.com/vej-ai/dtex/releases/tag/v0.18.0
 [0.17.0]: https://github.com/vej-ai/dtex/releases/tag/v0.17.0

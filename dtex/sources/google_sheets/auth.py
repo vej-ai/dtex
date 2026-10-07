@@ -68,15 +68,17 @@ def authorized_session(config: Config, scopes: Sequence[str]) -> Any:
 def load_credentials(config: Config, scopes: Sequence[str]) -> Any:
     """Resolve the credentials the ``auth_type`` / ``credentials_*`` params ask for,
     impersonating ``impersonate_service_account`` with ``scopes`` when set."""
-    credentials = _source_credentials(config, scopes)
     target = str(config.get("impersonate_service_account") or "").strip()
-    if not target:
-        return credentials
-    if not _SERVICE_ACCOUNT_EMAIL.fullmatch(target):
+    if target and not _SERVICE_ACCOUNT_EMAIL.fullmatch(target):
+        # Validate before resolving any credential: a bad target fails fast
+        # and identically whether or not ADC exists on the machine.
         raise ValueError(
             "impersonate_service_account must be a service-account email "
             "(name@project.iam.gserviceaccount.com)"
         )
+    credentials = _source_credentials(config, scopes)
+    if not target:
+        return credentials
     from google.auth import impersonated_credentials
 
     return impersonated_credentials.Credentials(

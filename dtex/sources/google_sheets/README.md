@@ -122,6 +122,13 @@ Enable the **Google Sheets API** in the credentials' project.
   ```
   On GCE / Cloud Run / GKE, ADC is the attached service account; share the
   sheet with it.
+* **Cloud Build, GCE and other places where the ambient token is
+  `cloud-platform` only** (the Sheets API refuses it): set
+  `impersonate_service_account` to the identity that should read the sheet,
+  which may be the build's own service account. dtex mints a short-lived token
+  with exactly the Sheets/Drive scopes through the IAM Credentials API; the
+  source identity needs `roles/iam.serviceAccountTokenCreator` on the target
+  (grant the account the role on itself for self-impersonation). No key.
 * **Key file:** `credentials_path: /secrets/sheets-reader.json`.
 * **Key in a secret store:** `credentials_json` takes a *reference*, resolved
   at run time and never logged — `${env.SHEETS_SA_JSON}` or

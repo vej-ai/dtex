@@ -88,6 +88,13 @@ params:
     description: >-
       A REFERENCE to a service-account key's JSON — ${env.VAR} or a secret://
       URL (docs/08 §3). Never the key itself.
+  impersonate_service_account:
+    type: string
+    default: ""
+    description: >-
+      Optional service-account email to mint a Sheets/Drive-scoped token for
+      through the IAM Credentials API (also the runner's own account). Use it
+      where the ambient token is cloud-platform-only, e.g. Cloud Build.
 
 streams:
   # One stream: every file under `folder` matching `glob`. The cursor field

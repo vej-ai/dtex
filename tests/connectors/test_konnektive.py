@@ -540,10 +540,15 @@ def _setenv(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _recent(days_ago: int, clock: str = "10:00:00") -> str:
-    """An account-local timestamp ``days_ago`` days back. Uses the local
-    date, which is within a day of any account timezone — windows in these
-    tests are matched by DATE, so that is exact enough."""
-    return f"{(datetime.now() - timedelta(days=days_ago)).date().isoformat()} {clock}"
+    """An account-local timestamp ``days_ago`` days back, on the account's
+    calendar (the connector's default ``account_timezone``). Windows in these
+    tests are matched by DATE, and the connector's last window ends on
+    "today" in the account's zone, so the machine's own date must not leak
+    in: a test run at 01:00 Europe/Vilnius is still "yesterday" in New York."""
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(tz=ZoneInfo("America/New_York")).date()
+    return f"{(today - timedelta(days=days_ago)).isoformat()} {clock}"
 
 
 def _router_for(rows_by_path: dict[str, list[dict[str, Any]]]) -> Responder:

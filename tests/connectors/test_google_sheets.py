@@ -489,6 +489,38 @@ def test_credentials_json_must_be_a_reference(monkeypatch: pytest.MonkeyPatch) -
     assert "PRIVATE KEY" not in str(info.value)
 
 
+def test_impersonation_mints_a_scoped_token_for_the_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    import google.auth
+    from google.auth import impersonated_credentials
+
+    source = object()
+    made: dict[str, object] = {}
+    monkeypatch.setattr(google.auth, "default", lambda scopes=None: (source, "p"))
+
+    class _Impersonated:
+        def __init__(self, **kwargs: object) -> None:
+            made.update(kwargs)
+
+    monkeypatch.setattr(impersonated_credentials, "Credentials", _Impersonated)
+    creds = auth.load_credentials(
+        Config(params={"impersonate_service_account": "runner@proj.iam.gserviceaccount.com"}),
+        [auth.SHEETS_READONLY_SCOPE],
+    )
+    assert isinstance(creds, _Impersonated)
+    assert made["source_credentials"] is source
+    assert made["target_principal"] == "runner@proj.iam.gserviceaccount.com"
+    assert made["target_scopes"] == [auth.SHEETS_READONLY_SCOPE]
+    # Without the param the ADC credentials are returned untouched.
+    assert auth.load_credentials(Config(params={}), ["s"]) is source
+
+
+def test_impersonation_target_must_be_a_service_account_email() -> None:
+    with pytest.raises(ValueError, match="impersonate_service_account must be"):
+        auth.load_credentials(
+            Config(params={"impersonate_service_account": "https://evil.example/x"}), ["s"]
+        )
+
+
 def test_auth_type_conflicts_are_explained() -> None:
     with pytest.raises(ValueError, match="auth_type is 'oauth'"):
         auth.load_credentials(

@@ -14,6 +14,15 @@ BigQuery destination's ``auth_type`` / ``credentials_path`` pair:
 * ``auth_type: service_account`` — a service-account JSON key, read from
   ``credentials_path`` (a file) or ``credentials_json``.
 
+``impersonate_service_account`` (optional, any ``auth_type``) mints a
+short-lived token for that service account with exactly the Sheets / Drive
+scopes through the IAM Credentials API. It is the way to get a scoped token
+where the ambient one cannot carry these scopes — Cloud Build and GCE hand
+the attached identity a ``cloud-platform``-only token, which the Sheets API
+refuses — and it works for the identity itself (the account needs
+``roles/iam.serviceAccountTokenCreator`` on the target, its own account
+included). No key is involved.
+
 ``credentials_json`` is a **reference**, never the key itself: ``${env.VAR}``
 (an environment variable holding the key JSON) or a ``secret://`` URL resolved
 through dtex's secret-manager resolvers (docs/08 §3). A literal JSON value is
@@ -28,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -37,6 +47,9 @@ SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
 _AUTH_TYPES = ("auto", "oauth", "service_account")
+_SERVICE_ACCOUNT_EMAIL = re.compile(
+    r"[a-z][a-z0-9-]{3,}@[a-z][a-z0-9-]*\.iam\.gserviceaccount\.com"
+)
 
 
 def authorized_session(config: Config, scopes: Sequence[str]) -> Any:
@@ -53,7 +66,29 @@ def authorized_session(config: Config, scopes: Sequence[str]) -> Any:
 
 
 def load_credentials(config: Config, scopes: Sequence[str]) -> Any:
-    """Resolve the credentials the ``auth_type`` / ``credentials_*`` params ask for."""
+    """Resolve the credentials the ``auth_type`` / ``credentials_*`` params ask for,
+    impersonating ``impersonate_service_account`` with ``scopes`` when set."""
+    credentials = _source_credentials(config, scopes)
+    target = str(config.get("impersonate_service_account") or "").strip()
+    if not target:
+        return credentials
+    if not _SERVICE_ACCOUNT_EMAIL.fullmatch(target):
+        raise ValueError(
+            "impersonate_service_account must be a service-account email "
+            "(name@project.iam.gserviceaccount.com)"
+        )
+    from google.auth import impersonated_credentials
+
+    return impersonated_credentials.Credentials(
+        source_credentials=credentials,
+        target_principal=target,
+        target_scopes=list(scopes),
+        lifetime=3600,
+    )
+
+
+def _source_credentials(config: Config, scopes: Sequence[str]) -> Any:
+    """ADC or a service-account key, per ``auth_type`` / ``credentials_*``."""
     auth_type = str(config.get("auth_type") or "auto").strip().lower()
     credentials_path = str(config.get("credentials_path") or "").strip()
     credentials_ref = str(config.get("credentials_json") or "").strip()

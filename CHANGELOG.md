@@ -10,6 +10,16 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-10-08
+
+### Added
+
+- `google_sheets` / `google_drive`: optional `impersonate_service_account`
+  mints a Sheets/Drive-scoped token for a service account (the runner's own
+  included) through the IAM Credentials API. Cloud Build and GCE hand the
+  attached identity a `cloud-platform`-only token, which the Sheets API
+  refuses; this gives those runtimes a keyless way to read a shared sheet.
+
 ## [0.20.0] — 2026-10-06
 
 ### Added
@@ -1504,7 +1514,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/vej-ai/dtex/releases/tag/v0.20.1
 [0.20.0]: https://github.com/vej-ai/dtex/releases/tag/v0.20.0
 [0.19.0]: https://github.com/vej-ai/dtex/releases/tag/v0.19.0
 [0.18.0]: https://github.com/vej-ai/dtex/releases/tag/v0.18.0

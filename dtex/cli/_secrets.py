@@ -83,6 +83,9 @@ def _resolve_one(
         # The exception's str() is the operator-facing message
         # (resolve_secret_ref / ConfigError never inline the resolved value
         # because resolution failed BEFORE a value existed).
+        if ref.optional and isinstance(exc, cfg.ConfigError):
+            # Not an error: an optional secret only unlocks extra work.
+            return True, f"optional, not configured ({exc})"
         return False, str(exc)
     return True, None
 

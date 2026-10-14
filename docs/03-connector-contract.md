@@ -336,6 +336,7 @@ secrets:
 |---|---|---|---|
 | `name` | string | **Yes** | Logical name. The body reads it as `config.secrets["api_token"]`. |
 | `ref` | string | **Yes** | Resolution expression. `${env.X}` reads env var `X`; `${profile.X.Y}` reads key `Y` of profile block `X` (chapter 06); `secret://<scheme>/<path>[#<field>]` dispatches to a pluggable resolver (chapter 08 §3). |
+| `optional` | bool | No | Default `false`. When `true`, a ref that does not resolve is left out of `config.secrets` instead of failing the run. For a credential that only unlocks extra work: the body checks `"name" in config.secrets` and skips that work without it. `dtex secrets test` reports it as configured-or-optional, not as a failure. |
 
 The engine resolves refs lazily and never logs secret values.
 

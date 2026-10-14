@@ -246,6 +246,7 @@ class FakeRC:
         self.subscriptions: dict[str, list[dict[str, Any]]] = {}
         self.transactions: dict[str, list[dict[str, Any]]] = {}
         self.chart_transactions: dict[date, int] = {}
+        self.refund_times: dict[str, datetime] = {}
         self.sort_key: Callable[[str], Any] = lambda cid: cid
         self.requests: list[str] = []
         self._lock = threading.Lock()
@@ -325,7 +326,30 @@ class FakeRC:
         ]
         self.chart_transactions[at.date()] = self.chart_transactions.get(at.date(), 0) + 1
 
-    def refund(self, cid: str, sub_id: str) -> None:
+    def renew(self, sub_id: str, txn_id: str, at: datetime, gross: float = 10.0) -> None:
+        """A new period of an existing subscription."""
+        period = json.loads(json.dumps(self.transactions[sub_id][0]))
+        period.update(
+            {
+                "id": txn_id,
+                "purchased_at": _ms(at),
+                "expiration_date": _ms(at + timedelta(days=30)),
+                "effective_expiration_date": _ms(at + timedelta(days=30)),
+            }
+        )
+        for block in ("revenue_in_usd", "revenue_in_local_currency"):
+            period[block] = {**period[block], "gross": gross}
+        self.transactions[sub_id].append(period)
+        for subs in self.subscriptions.values():
+            for sub in subs:
+                if sub["id"] == sub_id:  # RC moves the current period on renewal
+                    sub["current_period_starts_at"] = _ms(at)
+                    sub["current_period_ends_at"] = _ms(at + timedelta(days=30))
+                    sub["store_subscription_identifier"] = txn_id
+
+    def refund(self, cid: str, sub_id: str, at: datetime | None = None) -> None:
+        for txn in self.transactions[sub_id]:
+            self.refund_times[txn["id"]] = at or T0
         for sub in self.subscriptions[cid]:
             if sub["id"] == sub_id:
                 sub["total_revenue_in_usd"] = {"gross": 0, "tax": 0, "commission": 0, "proceeds": 0}
@@ -343,12 +367,41 @@ class FakeRC:
             next_page = f"{self.base_url}{path}?starting_after={page[-1]['id']}&limit={limit}"
         return {"object": "list", "items": page, "next_page": next_page}
 
+    def _v1_subscriber(self, cid: str) -> dict:
+        """v1 GET /subscribers: one entry per product, the LATEST period only."""
+        subscriptions: dict[str, dict] = {}
+        for sub in self.subscriptions.get(cid, []):
+            latest = max(self.transactions[sub["id"]], key=lambda t: t["purchased_at"])
+            refunded = self.refund_times.get(latest["id"])
+            subscriptions[latest["product_store_identifier"]] = {
+                "store_transaction_id": latest["id"],
+                "store": sub["store"],
+                "is_sandbox": False,
+                "period_type": "normal",
+                "purchase_date": datetime.fromtimestamp(latest["purchased_at"] / 1000, UTC)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "expires_date": datetime.fromtimestamp(latest["expiration_date"] / 1000, UTC)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "refunded_at": refunded.isoformat().replace("+00:00", "Z") if refunded else None,
+                "grace_period_expires_date": None,
+                "billing_issues_detected_at": None,
+                "unsubscribe_detected_at": None,
+                "price": {"amount": latest["revenue_in_usd"]["gross"], "currency": "USD"},
+            }
+        return {"subscriber": {"original_app_user_id": cid, "subscriptions": subscriptions}}
+
     def handle(self, raw_path: str) -> tuple[int, dict]:
         with self._lock:
             self.requests.append(raw_path)
         url = urlparse(raw_path)
         query = parse_qs(url.query)
         parts = [unquote(p) for p in url.path.strip("/").split("/")]
+        if parts[:2] == ["v1", "subscribers"] and len(parts) == 3:
+            # v1 GET creates an unknown subscriber; the connector must only ask for known ones.
+            assert parts[2] in self.customers, raw_path
+            return 200, self._v1_subscriber(parts[2])
         assert parts[:2] == ["projects", "proj_test"], raw_path
         rest = parts[2:]
         if rest == ["customers"]:
@@ -468,6 +521,7 @@ def _project(tmp_path: Path, fake: FakeRC, streams: str = "all", extra_params: s
         "name: rc_test\nsource: revenuecat\ndestination: duckdb\ntarget: dev\n"
         "params:\n  project_id: 'proj_test'\n"
         f"  base_url: '{fake.base_url}'\n  rate_per_second: 0\n  max_retries: 0\n  page_size: 3\n"
+        f"  v1_base_url: '{fake.base_url}/v1'\n  v1_rate_per_second: 0\n"
         f"  landed_reader: duckdb\n  landed_dataset: '{db_path}'\n"
         "  metrics_initial_since_date: '2026-09-01'\n"
         f"  metrics_charts: 'revenue'\n{extra_params}"
@@ -476,8 +530,18 @@ def _project(tmp_path: Path, fake: FakeRC, streams: str = "all", extra_params: s
     return db_path
 
 
-def _run(tmp_path: Path, db_path: str, monkeypatch: pytest.MonkeyPatch, at: datetime) -> None:
+def _run(
+    tmp_path: Path,
+    db_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    at: datetime,
+    v1_key: str | None = None,
+) -> None:
     monkeypatch.setenv("REVENUECAT_API_KEY", "sk_test_unit")
+    if v1_key is None:
+        monkeypatch.delenv("REVENUECAT_API_KEY_V1", raising=False)
+    else:
+        monkeypatch.setenv("REVENUECAT_API_KEY_V1", v1_key)
     monkeypatch.setenv("DTEX_REVENUECAT_NOW", at.isoformat())
     result = dtex.run(
         config="rc_test", project_dir=str(tmp_path), destination_params_override={"path": db_path}
@@ -674,3 +738,63 @@ def test_metrics_daily_backfills_then_repulls_the_trailing_window(
     )
     assert _query(db_path, revised) == [(9.0,)]
     assert any("start_date=2026-09-14" in r for r in fake_rc.requests)
+
+
+# --------------------------------------------------------------------------
+# subscriber_periods (v1)
+# --------------------------------------------------------------------------
+
+
+def test_subscriber_periods_take_refund_dates_from_v1(
+    fake_rc: FakeRC, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v2 only shows that a gross dropped; v1 says when RevenueCat refunded
+    it. The date is RevenueCat's to the second and survives the next period
+    replacing the refunded one in v1's per-product view."""
+    fake_rc.add_customer("c", T0 - timedelta(days=3))
+    fake_rc.add_purchase("c", "sub_1", "txn_1", T0 - timedelta(days=3), gross=25.0)
+    db_path = _project(tmp_path, fake_rc)
+    _run(tmp_path, db_path, monkeypatch, T0, v1_key="sk_v1_unit")
+    # Backfill: the never-fetched customer is described once, nothing refunded yet.
+    assert _query(db_path, "SELECT store_transaction_id, refunded_at FROM subscriber_periods") == [
+        ("txn_1", None)
+    ]
+
+    refund_time = T0 + timedelta(minutes=17, seconds=5)
+    fake_rc.refund("c", "sub_1", at=refund_time)
+    _run(tmp_path, db_path, monkeypatch, T0 + timedelta(hours=1), v1_key="sk_v1_unit")
+    stamped = _query(
+        db_path,
+        "SELECT refund_detected_at IS NOT NULL FROM subscription_transactions WHERE id = 'txn_1'",
+    )
+    assert stamped == [(True,)]
+    # The DuckDB destination stores aware timestamps through the session time
+    # zone; epoch_us(CAST(... AS TIMESTAMPTZ)) undoes it, as landed.py does.
+    refunded_us = (
+        "SELECT epoch_us(CAST(refunded_at AS TIMESTAMPTZ)) FROM subscriber_periods "
+        "WHERE store_transaction_id = 'txn_1'"
+    )
+    assert _query(db_path, refunded_us) == [(int(refund_time.timestamp() * 1_000_000),)]
+
+    # The next period replaces txn_1 in v1's view; its refund date is kept.
+    fake_rc.renew("sub_1", "txn_2", T0 + timedelta(days=27))
+    _run(tmp_path, db_path, monkeypatch, T0 + timedelta(days=27, hours=1), v1_key="sk_v1_unit")
+    assert _query(db_path, refunded_us) == [(int(refund_time.timestamp() * 1_000_000),)]
+    assert _query(db_path, "SELECT store_transaction_id FROM subscriber_periods ORDER BY 1") == [
+        ("txn_1",),
+        ("txn_2",),
+    ]
+    state = dict(_query(db_path, "SELECT stream, CAST(state_blob AS VARCHAR) FROM _dtex_state"))
+    assert "v1_changed_watermark" in state["subscriber_periods"]
+
+
+def test_subscriber_periods_skip_without_a_v1_key(
+    fake_rc: FakeRC, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """api_key_v1 is optional: without it the run succeeds and v1 is never called."""
+    fake_rc.add_customer("c", T0 - timedelta(days=3))
+    fake_rc.add_purchase("c", "sub_1", "txn_1", T0 - timedelta(days=3))
+    db_path = _project(tmp_path, fake_rc)
+    _run(tmp_path, db_path, monkeypatch, T0)
+    assert not any(r.startswith("/v1/") for r in fake_rc.requests)
+    assert _query(db_path, "SELECT id FROM subscription_transactions") == [("txn_1",)]

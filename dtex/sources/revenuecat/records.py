@@ -295,3 +295,75 @@ def transaction_record(
         "extracted_at": now_iso,
         "refund_detected_at": refund,
     }
+
+
+# ---------------------------------------------------------------------------
+# subscriber_periods — RevenueCat v1 subscriber state per store transaction
+# ---------------------------------------------------------------------------
+
+
+def iso_text_to_iso(value: Any) -> str | None:
+    """A v1 ISO-8601 timestamp (``2025-01-31T12:00:00Z``) -> aware ISO string."""
+    if value is None or value == "":
+        return None
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).isoformat()
+
+
+def _later(a: str | None, b: Any) -> str | None:
+    """The later of a new ISO value and a landed one (either may be None)."""
+    b_iso = iso_of(b)
+    if a is None:
+        return b_iso
+    if b_iso is None:
+        return a
+    return a if to_ms(a) >= to_ms(b_iso) else b_iso  # type: ignore[operator]
+
+
+def subscriber_period_record(
+    customer_id: str, product_identifier: str, sub: dict, prev: dict | None, now_iso: str
+) -> dict:
+    """One ``subscriber_periods`` row from a v1 ``subscriber.subscriptions``
+    entry (keyed by product identifier; it describes the LATEST period of
+    that product only).
+
+    Carried forward from ``prev`` because v1 stops describing a period once
+    the next one of the same product starts:
+    * ``refunded_at`` — RevenueCat's own refund time; a refund is permanent,
+      so once seen it is kept.
+    * ``grace_period_expires_date`` — the latest grace end ever seen. After a
+      grace period lapses the store resets the period to its plain
+      expiration, while RevenueCat still counts the grace days as active.
+    Everything else is the current v1 value.
+    """
+    raw_price = sub.get("price")
+    price: dict[str, Any] = raw_price if isinstance(raw_price, dict) else {}
+    refunded = iso_text_to_iso(sub.get("refunded_at"))
+    return {
+        "store_transaction_id": str(sub["store_transaction_id"]),
+        "customer_id": customer_id,
+        "product_identifier": product_identifier,
+        "product_plan_identifier": sub.get("product_plan_identifier"),
+        "store": sub.get("store"),
+        "is_sandbox": sub.get("is_sandbox"),
+        "period_type": sub.get("period_type"),
+        "ownership_type": sub.get("ownership_type"),
+        "purchase_date": iso_text_to_iso(sub.get("purchase_date")),
+        "original_purchase_date": iso_text_to_iso(sub.get("original_purchase_date")),
+        "expires_date": iso_text_to_iso(sub.get("expires_date")),
+        "grace_period_expires_date": _later(
+            iso_text_to_iso(sub.get("grace_period_expires_date")),
+            (prev or {}).get("grace_period_expires_date"),
+        ),
+        "refunded_at": refunded or iso_of((prev or {}).get("refunded_at")),
+        "billing_issues_detected_at": iso_text_to_iso(sub.get("billing_issues_detected_at")),
+        "unsubscribe_detected_at": iso_text_to_iso(sub.get("unsubscribe_detected_at")),
+        "auto_resume_date": iso_text_to_iso(sub.get("auto_resume_date")),
+        "price_amount": _f(price.get("amount")),
+        "price_currency": price.get("currency"),
+        "first_extracted_at": iso_of((prev or {}).get("first_extracted_at")) or now_iso,
+        "extracted_at": now_iso,
+    }

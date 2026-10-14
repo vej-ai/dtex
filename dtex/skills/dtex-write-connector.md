@@ -362,6 +362,19 @@ The `${env.X}` form requires nothing extra. The `secret://` form requires
 the matching extra: `pip install 'dtex[gcp-secrets]'` (or `[aws-secrets]`
 or `[vault]`).
 
+A secret that only unlocks extra work (a second API, an optional stream)
+can be declared `optional: true`. When it does not resolve it is left out
+of `config.secrets` instead of failing the run; the body checks
+`"name" in config.secrets` (or `config.secrets.get("name")`) and skips that
+work:
+
+```yaml
+secrets:
+  - name: api_key_v1
+    ref: ${env.MY_V1_KEY}
+    optional: true
+```
+
 The resolver runs once per run and registers the value with the per-run
 Redactor — secrets never appear in stdout, JSONL logs, or run records.
 

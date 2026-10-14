@@ -10,6 +10,21 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-14
+
+### Added
+
+- `revenuecat` connector 2.1: new `subscriber_periods` stream with
+  RevenueCat's own `refunded_at`, grace end, billing-issue and cancel dates
+  per store transaction, from the v1 `GET /subscribers/{id}` endpoint (v2
+  exposes no refund date). v1 is used only as a per-customer lookup for ids
+  the v2 streams already landed: refunds to confirm, customers whose
+  subscription changed, then a capped backfill. Needs the new optional
+  `api_key_v1` secret (`REVENUECAT_API_KEY_V1`); without it the stream skips.
+- Secrets: `optional: true` on a `register.yaml` secret leaves an unresolved
+  secret out of `config.secrets` instead of failing the run, and
+  `dtex secrets test` reports it as optional rather than as a failure.
+
 ## [0.20.1] — 2026-10-08
 
 ### Added
@@ -1514,7 +1529,8 @@ The first public release.
 - **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
   the private-disclosure channel and response timelines.
 
-[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/vej-ai/dtex/releases/tag/v0.21.0
 [0.20.1]: https://github.com/vej-ai/dtex/releases/tag/v0.20.1
 [0.20.0]: https://github.com/vej-ai/dtex/releases/tag/v0.20.0
 [0.19.0]: https://github.com/vej-ai/dtex/releases/tag/v0.19.0

@@ -744,9 +744,9 @@ def subscriber_periods(config: Config, state: State, log: logging.Logger) -> Ite
     ``grace_period_expires_date``, ``billing_issues_detected_at`` and
     ``unsubscribe_detected_at``, but only for the LATEST period of each
     product. So a customer is fetched while the period that changed is still
-    the latest one: checked against RevenueCat's export, that dates 128 of
-    130 refunds to the minute; the other 2 refunded an older period after
-    the next renewal and keep the v2 detection stamp.
+    the latest one, which dates almost every refund to the minute; a refund
+    of an older period made after the next renewal never appears in v1 and
+    keeps the v2 detection stamp.
 
     Targets, in order, capped by ``max_v1_customers_per_run``:
     1. refunds to confirm: a transaction with ``refund_detected_at`` whose

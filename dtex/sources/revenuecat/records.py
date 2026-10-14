@@ -303,7 +303,7 @@ def transaction_record(
 
 
 def iso_text_to_iso(value: Any) -> str | None:
-    """A v1 ISO-8601 timestamp (``2026-09-12T14:31:33Z``) -> aware ISO string."""
+    """A v1 ISO-8601 timestamp (``2025-01-31T12:00:00Z``) -> aware ISO string."""
     if value is None or value == "":
         return None
     text = str(value)

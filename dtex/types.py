@@ -882,6 +882,12 @@ class SecretRef:
 
     name: str
     ref: str
+    # ``optional: true`` — a ref that does not resolve (env var unset,
+    # profile key or managed secret missing) is left out of
+    # ``config.secrets`` instead of failing the run. For a credential that
+    # only unlocks an extra stream: the body checks ``"name" in
+    # config.secrets`` and skips that work when it is absent.
+    optional: bool = False
 
     # NOTE: stage 9a added a third resolver form — ``secret://<scheme>/<path>[#<field>]``
     # — for pluggable cloud secret managers (docs/08 §3, Q3 resolved). The
@@ -897,7 +903,7 @@ class SecretRef:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SecretRef:
         """Build a :class:`SecretRef` from a parsed YAML mapping — docs/03 §2.5."""
-        known = {"name", "ref"}
+        known = {"name", "ref", "optional"}
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"unknown secret key(s): {', '.join(sorted(unknown))}")
@@ -911,7 +917,10 @@ class SecretRef:
                 f"secret {data['name']!r} ref {ref!r} must use a known resolver: "
                 f"${{env.X}}, ${{profile.X.Y}}, or secret://<scheme>/<path>[#<field>]"
             )
-        return cls(name=str(data["name"]), ref=ref)
+        optional = data.get("optional", False)
+        if not isinstance(optional, bool):
+            raise ValueError(f"secret {data['name']!r} optional must be true or false")
+        return cls(name=str(data["name"]), ref=ref, optional=optional)
 
     @classmethod
     def is_valid_ref(cls, ref: str) -> bool:

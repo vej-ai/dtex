@@ -339,7 +339,8 @@ def subscriber_period_record(
       expiration, while RevenueCat still counts the grace days as active.
     Everything else is the current v1 value.
     """
-    price = sub.get("price") if isinstance(sub.get("price"), dict) else {}
+    raw_price = sub.get("price")
+    price: dict[str, Any] = raw_price if isinstance(raw_price, dict) else {}
     refunded = iso_text_to_iso(sub.get("refunded_at"))
     return {
         "store_transaction_id": str(sub["store_transaction_id"]),

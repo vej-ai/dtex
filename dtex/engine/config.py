@@ -659,12 +659,17 @@ def resolve_secrets(
     Returns the logical-name → value map handed to :class:`Config` as its
     ``secrets``. Connector code reads it via ``config.secrets["api_token"]``
     (docs/03 §3). Each ref goes through :func:`resolve_secret_ref`; a missing
-    one fails the run with a non-leaking message.
+    one fails the run with a non-leaking message, unless the ref is declared
+    ``optional: true``, in which case it is simply absent from the map.
     """
-    return {
-        ref.name: resolve_secret_ref(ref, target_name, profiles)
-        for ref in manifest.secrets
-    }
+    resolved: dict[str, str] = {}
+    for ref in manifest.secrets:
+        try:
+            resolved[ref.name] = resolve_secret_ref(ref, target_name, profiles)
+        except ConfigError:
+            if not ref.optional:
+                raise
+    return resolved
 
 
 # ---------------------------------------------------------------------------

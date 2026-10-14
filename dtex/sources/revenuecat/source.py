@@ -10,6 +10,7 @@ too small for a subscription snapshot:
     subscriptions             targets.plan_targets -> per-customer /subscriptions
     customer_details          aliases + attributes for customers with subscriptions
     subscription_transactions /subscriptions/{id}/transactions for changed subs
+    subscriber_periods        v1 /subscribers/{id}: RC's refund / grace / billing dates
     reconciliation_daily      landed transactions per day vs RC's own chart
     metrics_daily             RC charts, long format
 
@@ -40,6 +41,7 @@ from .records import (
     customer_details_record,
     customer_record,
     product_record,
+    subscriber_period_record,
     subscription_record,
     transaction_record,
 )
@@ -59,6 +61,7 @@ _SWEEP_WATERMARK_KEY = "sweep_watermark"
 _RECENTLY_EMPTY_KEY = "recently_empty"
 _RECENTLY_EMPTY_CAP = 20000
 _CHANGED_WATERMARK_KEY = "changed_watermark"
+_V1_WATERMARK_KEY = "v1_changed_watermark"
 _NO_TXNS_KEY = "subscriptions_without_transactions"
 _NO_TXNS_CAP = 20000
 # State keys of connector versions before 2.0. The skip list is the bug this
@@ -723,6 +726,165 @@ def subscription_transactions(config: Config, state: State, log: logging.Logger)
         len(targets),
         n_refunds,
         client.requests_made,
+    )
+
+
+# ---------------------------------------------------------------------------
+# subscriber_periods — RevenueCat's own refund / grace / billing timestamps
+# ---------------------------------------------------------------------------
+
+
+@stream(name="subscriber_periods")
+def subscriber_periods(config: Config, state: State, log: logging.Logger) -> Iterator[Batch]:
+    """RevenueCat's own dates for each store transaction, from the v1 API.
+
+    v2 shows current state only: a refund is a gross that dropped, with no
+    date, and a lapsed grace period vanishes from the period's end. v1
+    ``GET /subscribers/{app_user_id}`` still carries ``refunded_at``,
+    ``grace_period_expires_date``, ``billing_issues_detected_at`` and
+    ``unsubscribe_detected_at``, but only for the LATEST period of each
+    product. So a customer is fetched while the period that changed is still
+    the latest one: checked against RevenueCat's export, that dates 128 of
+    130 refunds to the minute; the other 2 refunded an older period after
+    the next renewal and keep the v2 detection stamp.
+
+    Targets, in order, capped by ``max_v1_customers_per_run``:
+    1. refunds to confirm: a transaction with ``refund_detected_at`` whose
+       period has no v1 refund date fetched after the detection;
+    2. customers whose subscription changed since this stream's watermark
+       (refunds, billing issues, renewals, cancellations);
+    3. backfill: customers with landed transactions never fetched here,
+       newest purchase first.
+
+    Needs the optional ``api_key_v1`` secret (a v1 secret key; a v2 key is
+    rejected). Without it the stream logs and skips. v1's GET creates a
+    subscriber it does not know, so only ids already landed by
+    ``subscriptions`` are ever requested.
+    """
+    key = config.secrets.get("api_key_v1")
+    if not key:
+        log.info("revenuecat.subscriber_periods: no api_key_v1 configured, skipped")
+        return
+    v1 = RevenueCatClient(
+        api_key=str(key),
+        project_id=str(config.project_id),
+        base_url=str(config.v1_base_url),
+        rate_per_second=float(config.v1_rate_per_second),
+        workers=int(config.workers),
+        max_retries=int(config.max_retries),
+    )
+    reader = _reader(config, log)
+    now_dt = _utcnow()
+    now = now_dt.isoformat()
+
+    landed = (
+        reader.rows(
+            "subscriber_periods",
+            [
+                "store_transaction_id",
+                "customer_id",
+                "refunded_at",
+                "grace_period_expires_date",
+                "first_extracted_at",
+                "extracted_at",
+            ],
+        )
+        or []
+    )
+    prev = {str(r["store_transaction_id"]): r for r in landed}
+    fetched = {r["customer_id"] for r in landed}
+
+    txns = (
+        reader.rows(
+            "subscription_transactions",
+            ["id", "customer_id", "environment", "purchased_at", "refund_detected_at"],
+        )
+        or []
+    )
+    to_confirm: dict[str, datetime] = {}
+    newest: dict[str, datetime] = {}
+    for t in txns:
+        cid = t.get("customer_id")
+        if not cid or t.get("environment") == "sandbox":
+            continue
+        purchased = _aware(t.get("purchased_at"))
+        if purchased is not None and (cid not in newest or purchased > newest[cid]):
+            newest[cid] = purchased
+        detected = _aware(t.get("refund_detected_at"))
+        if detected is None:
+            continue
+        seen = prev.get(str(t["id"]))
+        checked = _aware(seen.get("extracted_at")) if seen else None
+        unconfirmed = seen is None or not seen.get("refunded_at")
+        if unconfirmed and (checked is None or checked < detected):
+            to_confirm[cid] = min(detected, to_confirm.get(cid, detected))
+
+    watermark = _aware(state.get(_V1_WATERMARK_KEY)) or now_dt - timedelta(
+        hours=int(config.txn_lookback_hours)
+    )
+    changed: dict[str, datetime] = {}
+    for r in reader.rows("subscriptions", ["customer_id", "environment", "changed_at"]) or []:
+        cid, at = r.get("customer_id"), _aware(r.get("changed_at"))
+        if cid and r.get("environment") != "sandbox" and at is not None and at > watermark:
+            changed[cid] = max(at, changed.get(cid, at))
+
+    cap = int(config.max_v1_customers_per_run)
+    confirm_ids = sorted(to_confirm, key=lambda cid: to_confirm[cid])
+    changed_ids = sorted((c for c in changed if c not in to_confirm), key=lambda c: changed[c])
+    taken = set(confirm_ids) | set(changed_ids)
+    backfill_ids = sorted(
+        (c for c in newest if c not in fetched and c not in taken),
+        key=lambda c: newest[c],
+        reverse=True,
+    )
+    targets = (confirm_ids + changed_ids + backfill_ids)[:cap]
+    target_set = set(targets)
+    deferred = [changed[c] for c in changed_ids if c not in target_set]
+    if deferred:
+        new_watermark = max(watermark, min(deferred) - timedelta(milliseconds=1))
+    else:
+        new_watermark = max([watermark, *changed.values()])
+    log.info(
+        "revenuecat.subscriber_periods: %d customers (%d refunds to confirm, %d changed since %s, "
+        "%d backfill of %d never fetched, %d changed deferred by the cap)",
+        len(targets),
+        len(confirm_ids),
+        len(changed_ids),
+        watermark.isoformat(),
+        len([c for c in targets if c in set(backfill_ids)]),
+        len(backfill_ids),
+        len(deferred),
+    )
+
+    def fetch(cid: str) -> dict | None:
+        return v1.get_or_none(f"/subscribers/{_cid(cid)}")
+
+    batch: list[dict] = []
+    n_rows = n_refunds = 0
+    for cid, body in v1.map_concurrent(targets, fetch):
+        subs = ((body or {}).get("subscriber") or {}).get("subscriptions") or {}
+        for product_identifier, sub in subs.items():
+            if not isinstance(sub, dict) or sub.get("store_transaction_id") in (None, ""):
+                continue
+            before = prev.get(str(sub["store_transaction_id"]))
+            row = subscriber_period_record(cid, str(product_identifier), sub, before, now)
+            if row["refunded_at"] and not (before or {}).get("refunded_at"):
+                n_refunds += 1
+            batch.append(row)
+            n_rows += 1
+            if len(batch) >= int(config.batch_size):
+                yield batch
+                batch = []
+    if batch:
+        yield batch
+
+    state.set(_V1_WATERMARK_KEY, new_watermark.isoformat())
+    log.info(
+        "revenuecat.subscriber_periods: %d rows for %d customers, %d new refund dates, %d requests",
+        n_rows,
+        len(targets),
+        n_refunds,
+        v1.requests_made,
     )
 
 

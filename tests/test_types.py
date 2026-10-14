@@ -1054,3 +1054,35 @@ def test_incremental_max_staleness_parse() -> None:
         Incremental.from_dict({"cursor_field": "ts", "max_staleness": "soon"})
     with pytest.raises(ValueError, match="unknown incremental key"):
         Incremental.from_dict({"cursor_field": "ts", "max_stalenes": "1d"})
+
+
+def test_secret_ref_optional_flag() -> None:
+    """``optional`` defaults to False and must be a real boolean."""
+    assert SecretRef.from_dict({"name": "tok", "ref": "${env.X}"}).optional is False
+    assert SecretRef.from_dict({"name": "tok", "ref": "${env.X}", "optional": True}).optional
+    with pytest.raises(ValueError, match="optional must be true or false"):
+        SecretRef.from_dict({"name": "tok", "ref": "${env.X}", "optional": "yes"})
+
+
+def test_resolve_secrets_skips_an_unresolved_optional_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing optional secret is absent from the map; a missing required
+    one still fails the run."""
+    from types import SimpleNamespace
+
+    from dtex.engine.config import ConfigError, resolve_secrets
+
+    monkeypatch.setenv("DTEX_TEST_PRESENT", "value")
+    monkeypatch.delenv("DTEX_TEST_ABSENT", raising=False)
+    manifest = SimpleNamespace(
+        secrets=(
+            SecretRef(name="present", ref="${env.DTEX_TEST_PRESENT}"),
+            SecretRef(name="extra", ref="${env.DTEX_TEST_ABSENT}", optional=True),
+        )
+    )
+    assert resolve_secrets(manifest, "dev", None) == {"present": "value"}  # type: ignore[arg-type]
+
+    required = SimpleNamespace(secrets=(SecretRef(name="must", ref="${env.DTEX_TEST_ABSENT}"),))
+    with pytest.raises(ConfigError, match="DTEX_TEST_ABSENT"):
+        resolve_secrets(required, "dev", None)  # type: ignore[arg-type]

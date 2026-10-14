@@ -42,13 +42,18 @@
 #   subscription_transactions every period of each new or changed
 #                             subscription; keeps the first-seen gross and
 #                             stamps refund_detected_at when gross drops.
+#   subscriber_periods        v1 GET /subscribers for customers with a refund to
+#                             confirm, a changed subscription, or never fetched:
+#                             RevenueCat's own refunded_at, grace end, billing
+#                             issue and cancel dates per store transaction.
+#                             Optional: needs the api_key_v1 secret.
 #   reconciliation_daily      landed transactions per day vs RC's own count.
 #   metrics_daily             RC charts, long format.
 #
-# The four diff streams (subscriptions, customer_details,
-# subscription_transactions, reconciliation_daily) need `landed_reader` and
-# `landed_dataset` pointed at the destination this config writes to, under
-# the default table names. The other four run without.
+# The five diff streams (subscriptions, customer_details,
+# subscription_transactions, subscriber_periods, reconciliation_daily) need
+# `landed_reader` and `landed_dataset` pointed at the destination this config
+# writes to, under the default table names. The other four run without.
 #
 # Scale envelope: the hot set is re-fetched every run, one call per customer,
 # so an hourly cadence fits roughly 15-20k recently-active subscribers at the
@@ -57,12 +62,14 @@
 #
 # Auth: a v2 secret key (`sk_...`; v1 keys do not work on v2) with
 # customer_information:* read, project_configuration:* read (products,
-# entitlements) and charts_metrics:* read.
+# entitlements) and charts_metrics:* read. Optionally a v1 secret key
+# (`api_key_v1`; v2 keys do not work on v1) for subscriber_periods: v2 has no
+# refund date anywhere, v1 does.
 
 name: revenuecat
 kind: source
-version: "2.0.0"
-summary: RevenueCat v2 API — period-grain subscription transactions, subscriptions, customers, products and daily chart metrics, with a built-in completeness check.
+version: "2.1.0"
+summary: RevenueCat v2 API — period-grain subscription transactions, subscriptions, customers, products and daily chart metrics, with a built-in completeness check; optionally RevenueCat's own refund, grace and billing dates from v1.
 tags: [revenuecat, saas, subscriptions, analytics, mobile]
 
 requires:
@@ -168,6 +175,20 @@ params:
     default: 3
     description: Where subscription_transactions starts looking for changed subscriptions when it has no watermark yet (first run). Afterwards the watermark decides.
 
+  # --- subscriber_periods (v1) ----------------------------------------------
+  v1_base_url:
+    type: string
+    default: "https://api.revenuecat.com/v1"
+    description: RevenueCat v1 API base URL, overridable for stubbed tests.
+  v1_rate_per_second:
+    type: float
+    default: 5.0
+    description: Throttle for the v1 subscriber fetches (a separate bucket from the v2 calls). 0 disables it.
+  max_v1_customers_per_run:
+    type: int
+    default: 3000
+    description: Cap on v1 subscriber fetches per run. Refunds to confirm go first, then customers whose subscription changed, then the never-fetched backfill.
+
   # --- reconciliation_daily ---------------------------------------------------
   reconcile_days:
     type: int
@@ -200,6 +221,11 @@ secrets:
   # profile-level `ref: secret://gcp-secret-manager/...` overrides it.
   - name: api_key
     ref: ${env.REVENUECAT_API_KEY}
+  # A v1 secret key (a v2 key is rejected by v1). Only the subscriber_periods
+  # stream uses it; without it that stream skips and the rest runs as before.
+  - name: api_key_v1
+    ref: ${env.REVENUECAT_API_KEY_V1}
+    optional: true
 
 streams:
   - name: products
@@ -329,6 +355,36 @@ streams:
       - {name: first_extracted_at,        type: TIMESTAMP, mode: REQUIRED}
       - {name: extracted_at,              type: TIMESTAMP, mode: REQUIRED}
       - {name: refund_detected_at,        type: TIMESTAMP, description: "First run that saw gross_usd fall below the landed value. RC exposes no refund timestamp."}
+
+  # RevenueCat's own dates per store transaction, from v1 GET /subscribers.
+  # v1 describes only the LATEST period of each product, so a customer is
+  # fetched while the changed period is still the latest; refunded_at and the
+  # latest grace end are carried forward once seen. Needs api_key_v1.
+  - name: subscriber_periods
+    table: subscriber_periods
+    primary_key: [store_transaction_id]
+    write_disposition: merge
+    schema:
+      - {name: store_transaction_id,       type: STRING,    mode: REQUIRED, description: "Store transaction id; joins subscription_transactions.id."}
+      - {name: customer_id,                type: STRING,    mode: REQUIRED, description: "RC customer id the subscriber was fetched by."}
+      - {name: product_identifier,         type: STRING,    description: "v1 key of the entry (store product id, without the Google base plan)."}
+      - {name: product_plan_identifier,    type: STRING,    description: "Google base plan id; NULL on Apple."}
+      - {name: store,                      type: STRING}
+      - {name: is_sandbox,                 type: BOOLEAN}
+      - {name: period_type,                type: STRING,    description: "normal | trial | intro."}
+      - {name: ownership_type,             type: STRING}
+      - {name: purchase_date,              type: TIMESTAMP}
+      - {name: original_purchase_date,     type: TIMESTAMP}
+      - {name: expires_date,               type: TIMESTAMP}
+      - {name: grace_period_expires_date,  type: TIMESTAMP, description: "Latest grace end ever seen for the period (kept after the grace lapses)."}
+      - {name: refunded_at,                type: TIMESTAMP, description: "RevenueCat's refund time. Kept once seen."}
+      - {name: billing_issues_detected_at, type: TIMESTAMP}
+      - {name: unsubscribe_detected_at,    type: TIMESTAMP}
+      - {name: auto_resume_date,           type: TIMESTAMP}
+      - {name: price_amount,               type: FLOAT,     description: "v1 price of the period in price_currency."}
+      - {name: price_currency,             type: STRING}
+      - {name: first_extracted_at,         type: TIMESTAMP, mode: REQUIRED}
+      - {name: extracted_at,               type: TIMESTAMP, mode: REQUIRED, description: "Last fetch that described this period."}
 
   # Landed production transactions per UTC day against RC's own count (the
   # Transactions measure of the revenue chart). `missing` > 0 on a complete
